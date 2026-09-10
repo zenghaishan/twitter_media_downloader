@@ -385,7 +385,14 @@ onUnmounted(() => {
           <div class="media-thumbnail">
             <img v-if="file.type === 'image'" :src="file.path" :alt="file.name" loading="lazy" :class="{ 'privacy-blur': userStore.privacyMode }" />
             <div v-else class="video-thumbnail">
-              <img :src="file.thumb || file.path" :alt="file.name" loading="lazy" :class="{ 'privacy-blur': userStore.privacyMode }" />
+              <video
+                muted
+                playsinline
+                preload="metadata"
+                :src="file.thumb || (file.path + '#t=0.1')"
+                :alt="file.name"
+                :class="{ 'privacy-blur': userStore.privacyMode }"
+              ></video>
               <div class="video-play-icon">
                 <svg viewBox="0 0 24 24" fill="currentColor">
                   <polygon points="5 3 19 12 5 21 5 3"/>
@@ -411,7 +418,14 @@ onUnmounted(() => {
           <div class="media-list-thumb">
             <img v-if="file.type === 'image'" :src="file.path" :alt="file.name" loading="lazy" :class="{ 'privacy-blur': userStore.privacyMode }" />
             <div v-else class="video-thumb-small">
-              <img :src="file.thumb || file.path" :alt="file.name" loading="lazy" :class="{ 'privacy-blur': userStore.privacyMode }" />
+              <video
+                muted
+                playsinline
+                preload="metadata"
+                :src="file.thumb || (file.path + '#t=0.1')"
+                :alt="file.name"
+                :class="{ 'privacy-blur': userStore.privacyMode }"
+              ></video>
               <svg viewBox="0 0 24 24" fill="currentColor" class="play-icon-small">
                 <polygon points="5 3 19 12 5 21 5 3"/>
               </svg>

@@ -23,10 +23,28 @@ MEDIA_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.mp4', '.webm', '.webp'}
 zip_cache = {}
 CACHE_EXPIRY = 3600  # 缓存过期时间（秒）
 
+def resolve_media_dir(user_id: str, account_user_id: int = None) -> str:
+    """定位某用户的真实媒体目录。
+    优先：可配置 download_dir 下的“昵称(user_id)”子目录；
+    其次：download_dir 下同名目录；
+    回退：默认下载目录/<user_id>。
+    """
+    dl = database.get_config('download_dir', account_user_id)
+    root = dl.strip() if dl and dl.strip() else Config.DOWNLOAD_FOLDER
+    if os.path.isdir(root):
+        for name in os.listdir(root):
+            p = os.path.join(root, name)
+            if os.path.isdir(p) and f'({user_id})' in name:
+                return p
+        direct = os.path.join(root, user_id)
+        if os.path.isdir(direct):
+            return direct
+    return os.path.join(Config.DOWNLOAD_FOLDER, user_id)
 
-def count_media_files(user_id: str) -> int:
+
+def count_media_files(user_id: str, account_user_id: int = None) -> int:
     """统计用户文件夹中的实际媒体文件数量"""
-    user_folder = os.path.join(Config.DOWNLOAD_FOLDER, user_id)
+    user_folder = resolve_media_dir(user_id, account_user_id)
     if not os.path.isdir(user_folder):
         return 0
     
@@ -36,9 +54,9 @@ def count_media_files(user_id: str) -> int:
     return count
 
 
-def get_folder_size(user_id: str) -> int:
+def get_folder_size(user_id: str, account_user_id: int = None) -> int:
     """获取用户文件夹的实际总大小"""
-    user_folder = os.path.join(Config.DOWNLOAD_FOLDER, user_id)
+    user_folder = resolve_media_dir(user_id, account_user_id)
     if not os.path.isdir(user_folder):
         return 0
     
@@ -103,6 +121,7 @@ def start_download():
     download_type = data.get('download_type', 'all')  # all, video, image
     export_xlsx = data.get('export_xlsx', False)  # 是否导出xlsx
     create_zip = data.get('create_zip', False)  # 是否生成压缩包
+    force = data.get('force', False)  # 是否强制重新下载
     
     if not user_ids:
         return jsonify({'error': '请输入用户ID'}), 400
@@ -123,7 +142,7 @@ def start_download():
     # 创建下载任务
     tasks = []
     for user_id in user_id_list:
-        task = download_service.create_task(user_id, download_type, account_user_id, export_xlsx=export_xlsx, create_zip=create_zip)
+        task = download_service.create_task(user_id, download_type, account_user_id, export_xlsx=export_xlsx, create_zip=create_zip, force=force)
         tasks.append({
             'task_id': task.task_id,
             'user_id': user_id
@@ -132,13 +151,162 @@ def start_download():
     if len(tasks) == 1:
         return jsonify({
             'task_id': tasks[0]['task_id'],
+            'queue_size': download_service.queue_size(),
             'message': f'开始下载用户 {tasks[0]["user_id"]} 的媒体文件'
         })
     else:
         return jsonify({
             'tasks': tasks,
+            'queue_size': download_service.queue_size(),
             'message': f'已创建 {len(tasks)} 个下载任务'
         })
+
+
+@main_bp.route('/api/download-share', methods=['POST'])
+@login_required
+def start_download_share():
+    """通过分享链接下载：解析推文/用户链接并创建下载任务"""
+    data = request.get_json() or {}
+    share_url = (data.get('url') or '').strip()
+    if not share_url:
+        return jsonify({'error': '请输入分享链接'}), 400
+
+    # 匹配推文链接 https://x.com/<user>/status/<id>
+    share_re = re.search(r'(?:twitter\.com|x\.com)/([^/?]+)/status/(\d+)', share_url)
+    if share_re:
+        screen_name = share_re.group(1)
+        status_id = share_re.group(2)
+    else:
+        # 匹配用户主页链接 https://x.com/<user>
+        user_re = re.search(r'(?:twitter\.com|x\.com)/([^/?]+)', share_url)
+        if not user_re:
+            return jsonify({'error': '无法识别的链接，请提供 twitter.com 或 x.com 的分享链接'}), 400
+        screen_name = user_re.group(1)
+        status_id = None
+
+    current_user = get_current_user()
+    account_user_id = current_user['id'] if current_user else None
+    export_xlsx = data.get('export_xlsx', False)
+    create_zip = data.get('create_zip', False)
+    force = data.get('force', False)  # 是否强制重新下载
+
+    if status_id:
+        task = download_service.create_task(
+            screen_name, 'all', account_user_id,
+            export_xlsx=export_xlsx, create_zip=create_zip,
+            single_tweet=status_id, force=force, link=share_url
+        )
+        return jsonify({
+            'task_id': task.task_id,
+            'user_id': screen_name,
+            'queue_size': download_service.queue_size(),
+            'message': f'正在下载推文 {status_id} 的媒体（用户 @{screen_name}）'
+        })
+    else:
+        task = download_service.create_task(
+            screen_name, 'all', account_user_id,
+            export_xlsx=export_xlsx, create_zip=create_zip,
+            force=force, link=share_url
+        )
+        return jsonify({
+            'task_id': task.task_id,
+            'user_id': screen_name,
+            'queue_size': download_service.queue_size(),
+            'message': f'开始下载用户 @{screen_name} 的媒体文件'
+        })
+
+
+@main_bp.route('/api/re-download', methods=['POST'])
+@login_required
+def re_download():
+    """重新下载某条历史/队列任务的链接（强制重新下载，已提交过的链接会提到队首）"""
+    data = request.get_json() or {}
+    task_id = (data.get('task_id') or '').strip()
+    if not task_id:
+        return jsonify({'error': '缺少任务ID'}), 400
+
+    current_user = get_current_user()
+    account_user_id = current_user['id'] if current_user else None
+
+    task = download_service.get_task(task_id)
+    if not task:
+        return jsonify({'error': '任务不存在或已被清理'}), 404
+
+    try:
+        new_task = download_service.re_download_task(task, account_user_id)
+    except Exception as e:
+        return jsonify({'error': f'重新下载失败: {str(e)}'}), 500
+
+    return jsonify({
+        'task_id': new_task.task_id,
+        'user_id': new_task.user_id,
+        'queue_size': download_service.queue_size(),
+        'message': f'已重新入队下载 @{new_task.user_id} 的链接'
+    })
+
+
+def parse_share_url(share_url: str):
+    """解析分享链接，返回 (screen_name, status_id|None)。无法识别返回 (None, None)。"""
+    share_url = (share_url or '').strip()
+    if not share_url:
+        return None, None
+    share_re = re.search(r'(?:twitter\.com|x\.com)/([^/?]+)/status/(\d+)', share_url)
+    if share_re:
+        return share_re.group(1), share_re.group(2)
+    user_re = re.search(r'(?:twitter\.com|x\.com)/([^/?]+)', share_url)
+    if user_re:
+        return user_re.group(1), None
+    return None, None
+
+
+@main_bp.route('/api/preview-media', methods=['POST'])
+@login_required
+def preview_media():
+    """抓取媒体列表（不下载），供选择性下载勾选。"""
+    data = request.get_json() or {}
+    share_url = (data.get('url') or '').strip()
+    if not share_url:
+        return jsonify({'error': '请输入链接'}), 400
+
+    screen_name, status_id = parse_share_url(share_url)
+    if not screen_name:
+        return jsonify({'error': '无法识别的链接，请提供 twitter.com 或 x.com 的分享链接'}), 400
+
+    current_user = get_current_user()
+    account_user_id = current_user['id'] if current_user else None
+
+    try:
+        result = download_service.preview_media(screen_name, status_id, account_user_id)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': f'抓取媒体列表失败: {str(e)}'}), 500
+
+
+@main_bp.route('/api/download-selected', methods=['POST'])
+@login_required
+def download_selected():
+    """选择性下载：入队下载用户勾选的媒体项。"""
+    data = request.get_json() or {}
+    user_id = (data.get('user_id') or '').strip()
+    items = data.get('items') or []
+    force = data.get('force', False)
+
+    if not user_id:
+        return jsonify({'error': '缺少用户'}), 400
+    if not items:
+        return jsonify({'error': '未选择任何文件'}), 400
+
+    current_user = get_current_user()
+    account_user_id = current_user['id'] if current_user else None
+
+    task = download_service.create_selected_task(user_id, items, account_user_id, force=force)
+    return jsonify({
+        'task_id': task.task_id,
+        'user_id': user_id,
+        'count': len(items),
+        'queue_size': download_service.queue_size(),
+        'message': f'已入队下载 {len(items)} 个文件'
+    })
 
 
 @main_bp.route('/api/progress/<task_id>')
@@ -295,20 +463,18 @@ def create_user_zip(user_id: str):
 def download_zip(filename: str):
     """下载ZIP文件"""
     import threading
-    import mimetypes
-    import urllib.parse
-    
+
     zip_path = os.path.join(Config.DOWNLOAD_FOLDER, filename)
-    
+
     if not os.path.exists(zip_path):
         return jsonify({'error': '文件不存在'}), 404
-    
+
     # 获取删除延迟时间配置（默认20分钟）
     current_user = get_current_user()
     account_user_id = current_user['id'] if current_user else None
     delete_delay = database.get_config('zip_delete_delay', account_user_id)
     delete_minutes = int(delete_delay) if delete_delay else 20
-    
+
     # 定时删除ZIP文件
     def delete_zip_later():
         import time
@@ -319,42 +485,19 @@ def download_zip(filename: str):
                 print(f'已删除ZIP文件: {filename}')
         except Exception as e:
             print(f'删除ZIP文件失败: {e}')
-    
-    thread = threading.Thread(target=delete_zip_later)
-    thread.daemon = True
-    thread.start()
-    
-    # 获取文件大小
-    file_size = os.path.getsize(zip_path)
-    
-    # 设置响应头
-    mime_type = mimetypes.guess_type(filename)[0] or 'application/octet-stream'
-    
-    # 对文件名进行URL编码，处理中文字符
-    encoded_filename = urllib.parse.quote(filename, safe='')
-    content_disposition = f"attachment; filename*=UTF-8''{encoded_filename}"
-    
-    def generate():
-        with open(zip_path, 'rb') as f:
-            while True:
-                chunk = f.read(8192)
-                if not chunk:
-                    break
-                yield chunk
-    
-    response = Response(
-        generate(),
-        mimetype=mime_type,
-        headers={
-            'Content-Disposition': content_disposition,
-            'Content-Length': str(file_size),
-            'Content-Type': mime_type,
-            'Connection': 'keep-alive',
-            'Accept-Ranges': 'bytes'
-        }
+
+    threading.Thread(target=delete_zip_later, daemon=True).start()
+
+    # 用 send_file 处理流式传输：请求结束或连接中断时会自动释放文件句柄，
+    # 避免手写 generate() 在断连时泄漏句柄、导致ZIP文件被Python进程锁死。
+    # mimetype 固定为标准的 application/zip，保证浏览器正确按ZIP附件识别。
+    return send_file(
+        zip_path,
+        as_attachment=True,
+        download_name=os.path.basename(zip_path),
+        mimetype='application/zip',
+        conditional=True
     )
-    
-    return response
 
 
 # 配置管理API
@@ -438,7 +581,7 @@ def get_history():
     for item in history:
         user_id = item.get('user_id')
         if user_id and user_id not in user_folder_sizes:
-            user_folder_sizes[user_id] = get_folder_size(user_id)
+            user_folder_sizes[user_id] = get_folder_size(user_id, account_user_id)
         item['folder_size'] = user_folder_sizes.get(user_id, 0)
     
     return jsonify({
@@ -506,8 +649,8 @@ def get_gallery_users():
 
     # 使用文件夹中的实际媒体文件数量和大小替代数据库统计
     for user in users:
-        user['total_files'] = count_media_files(user['user_id'])
-        user['total_size'] = get_folder_size(user['user_id'])
+        user['total_files'] = count_media_files(user['user_id'], account_user_id)
+        user['total_size'] = get_folder_size(user['user_id'], account_user_id)
 
     return jsonify({
         'data': users,
@@ -584,6 +727,67 @@ async def _download_avatar(url: str, save_path: str, account_user_id: int = None
     except Exception:
         pass
     return False
+
+
+async def _fetch_thumb(url: str, account_user_id: int = None):
+    """通过配置的代理抓取 Twitter 封面图字节，供本地浏览器直接展示"""
+    try:
+        proxy = Config.get_proxy(user_id=account_user_id)
+        cookie = Config.get_cookie(user_id=account_user_id)
+        _proxy = proxy if proxy and proxy.strip() else None
+        headers = {
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36',
+            'referer': 'https://x.com/',
+        }
+        # 带上用户的 ct0/x-csrf，提高视频海报帧等受保护资源的抓取成功率
+        if cookie:
+            headers['cookie'] = cookie
+            m = re.search(r'ct0=([a-f0-9]+)', cookie)
+            if m:
+                headers['x-csrf-token'] = m.group(1)
+        async with httpx.AsyncClient(proxy=_proxy, timeout=20.0, follow_redirects=True) as client:
+            response = await client.get(url, headers=headers)
+            if response.status_code == 200:
+                return response.content
+    except Exception:
+        pass
+    return None
+
+
+@main_bp.route('/api/thumb')
+@login_required
+def media_thumb():
+    """本地代理 Twitter 封面/图片，解决浏览器无法直连 CDN 导致封面不显示的问题"""
+    url = (request.args.get('url') or '').strip()
+    if not url:
+        return jsonify({'error': '缺少url'}), 400
+    # 仅允许加载 Twitter 媒体 CDN，避免被当作任意代理(SSRF)
+    if not (url.startswith('https://pbs.twimg.com/') or url.startswith('https://video.twimg.com/')):
+        return jsonify({'error': '非法的图片地址'}), 400
+
+    current_user = get_current_user()
+    account_user_id = current_user['id'] if current_user else None
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        data = loop.run_until_complete(_fetch_thumb(url, account_user_id))
+    finally:
+        loop.close()
+    if data is None:
+        return jsonify({'error': '获取封面失败'}), 502
+
+    if '.png' in url.lower():
+        mime = 'image/png'
+    elif '.gif' in url.lower():
+        mime = 'image/gif'
+    elif '.webp' in url.lower():
+        mime = 'image/webp'
+    else:
+        mime = 'image/jpeg'
+    resp = Response(data, mimetype=mime)
+    resp.headers['Cache-Control'] = 'public, max-age=86400'
+    return resp
 
 
 @main_bp.route('/api/avatar/<user_id>')
@@ -682,8 +886,10 @@ def get_user_media(user_id: str):
         per_page = request.args.get('per_page', 24, type=int)
         file_type = request.args.get('type', 'all').strip()  # all, image, video
         
-        # 构建用户目录路径
-        user_dir = os.path.join(Config.BASE_DIR, 'downloads', user_id)
+        # 构建用户目录路径（兼容自定义 download_dir + 昵称(user_id) 子目录）
+        current_user = get_current_user()
+        account_user_id = current_user['id'] if current_user else None
+        user_dir = resolve_media_dir(user_id, account_user_id)
         thumb_dir = os.path.join(Config.BASE_DIR, 'downloads', '.thumbnails', user_id)
         
         if not os.path.exists(user_dir):
@@ -815,12 +1021,16 @@ def serve_media_file(user_id: str, filename: str):
     try:
         from config import Config
         
-        filepath = os.path.join(Config.BASE_DIR, 'downloads', user_id, filename)
+        current_user = get_current_user()
+        account_user_id = current_user['id'] if current_user else None
+        user_dir = resolve_media_dir(user_id, account_user_id)
+        filepath = os.path.join(user_dir, filename)
         
         if not os.path.exists(filepath):
             return jsonify({'error': '文件不存在'}), 404
         
-        return send_file(filepath)
+        # conditional=True 支持 Range 请求，保证浏览器能对视频做 seek/加载元数据（pose预览首帧）
+        return send_file(filepath, conditional=True)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -914,6 +1124,13 @@ def get_task_logs_api(task_id: str):
     limit = request.args.get('limit', 100, type=int)
     logs = log_manager.get_logs(task_id, limit=limit)
     return jsonify({'data': logs})
+
+
+@main_bp.route('/api/download-queue', methods=['GET'])
+@login_required
+def get_download_queue():
+    """获取当前下载队列：正在执行 + 排队等待"""
+    return jsonify(download_service.queue_list())
 
 
 @main_bp.route('/api/logs', methods=['DELETE'])

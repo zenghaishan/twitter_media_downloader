@@ -4,6 +4,7 @@ import time
 import zipfile
 import asyncio
 import threading
+import queue
 from typing import Dict, Optional
 from datetime import datetime
 
@@ -21,6 +22,15 @@ class DownloadService:
     def __init__(self):
         self._tasks: Dict[str, DownloadTask] = {}
         self._lock = threading.Lock()
+        # 每个用户的串行锁，避免同一用户多个任务并发写同一目录导致 Windows WinError5
+        self._user_locks: Dict[str, threading.Lock] = {}
+        self._user_locks_guard = threading.Lock()
+        
+        # 全局下载队列：所有任务先入队，由单一工作线程串行消费，支持持续添加链接
+        self._dl_queue = queue.Queue()
+        self._task_order: list = []  # 入队顺序（排队等待的任务），供队列展示
+        self._worker_started = False
+        self._worker_guard = threading.Lock()
         
         # 确保下载目录存在
         os.makedirs(Config.DOWNLOAD_FOLDER, exist_ok=True)
@@ -47,15 +57,20 @@ class DownloadService:
             task.downloaded_files = history.get('downloaded_files', 0)
             task.zip_path = history.get('zip_path')
             task.error_message = history.get('error_message')
+            task.link = history.get('link')
             task.progress = 100 if history['status'] == 'completed' else 0
             return task
         
         return None
     
-    def create_task(self, user_id: str, download_type: str = 'all', account_user_id: int = None, export_xlsx: bool = False, create_zip: bool = True) -> DownloadTask:
-        """创建下载任务"""
-        # 检查是否已有该用户的下载记录
-        existing_record = database.get_latest_download_by_user_id(user_id)
+    def create_task(self, user_id: str, download_type: str = 'all', account_user_id: int = None, export_xlsx: bool = False, create_zip: bool = True, single_tweet: str = None, force: bool = False, link: str = None) -> DownloadTask:
+        """创建下载任务
+        single_tweet: 若提供推文ID，则只下载该推文的媒体
+        force: 若为True，忽略"已存在"去重，强制重新下载
+        link: 原始提交链接（用于队列展示与重复提交排序提升）
+        """
+        # 检查是否已有该用户的下载记录（单推文分享任务不复用历史）
+        existing_record = None if single_tweet else database.get_latest_download_by_user_id(user_id)
         
         if existing_record:
             # 复用之前的task_id
@@ -71,27 +86,208 @@ class DownloadService:
                 created_at=time.strftime('%Y-%m-%d %H:%M:%S')
             )
         else:
-            # 创建新的task_id
-            task_id = f"{user_id}_{int(time.time())}"
+            # 创建新的task_id（时间戳+随机后缀，彻底避免并发/同秒时UNIQUE冲突）
+            import uuid
+            task_id = f"{user_id}_{int(time.time())}_{uuid.uuid4().hex[:6]}"
             # 添加到数据库
-            database.add_download_history(task_id, user_id, account_user_id=account_user_id)
+            database.add_download_history(task_id, user_id, account_user_id=account_user_id, link=link)
         
         task = DownloadTask(task_id, user_id, download_type, account_user_id=account_user_id, export_xlsx=export_xlsx, create_zip=create_zip)
+        task.link = link
+        if existing_record:
+            database.update_download_history(task_id, link=link)
         
         with self._lock:
             self._tasks[task_id] = task
         
-        # 记录实时日志
-        log_manager.info(task_id, user_id, f'下载任务已创建: {user_id}', 'system')
+        # 标记为排队中并写入数据库
+        task.status = 'queued'
+        database.update_download_history(task_id, status='queued')
         
-        # 在后台线程中启动下载
-        thread = threading.Thread(target=self._run_download, args=(task_id,))
-        thread.daemon = True
-        thread.start()
+        # 记录实时日志
+        log_manager.info(task_id, user_id, f'下载任务已加入队列: {user_id}', 'system')
+        
+        # 入队并由单一工作线程串行执行（而非每个任务开新线程）
+        self._enqueue(task_id, link, single_tweet, force, None)
         
         return task
+
+    def create_selected_task(self, user_id: str, items: list, account_user_id: int = None, force: bool = False, link: str = None) -> DownloadTask:
+        """创建“选择性下载”任务：仅下载用户勾选的媒体项。
+        items: [{url, date_str, tweet_id, media_index, media_count, csv_info}]
+        """
+        import uuid
+        task_id = f"sel_{user_id}_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+        database.add_download_history(task_id, user_id, account_user_id=account_user_id, link=link)
+
+        task = DownloadTask(task_id, user_id, 'all', account_user_id=account_user_id, export_xlsx=False, create_zip=True)
+        # 记录待下载的媒体项，供 worker 消费
+        task.selected_items = items
+        task.link = link
+
+        with self._lock:
+            self._tasks[task_id] = task
+
+        task.status = 'queued'
+        database.update_download_history(task_id, status='queued')
+        log_manager.info(task_id, user_id, f'选择性下载任务已加入队列: {user_id}（{len(items)} 个文件）', 'system')
+
+        self._enqueue(task_id, link, None, force, items)
+
+        return task
+
+    def _enqueue(self, task_id: str, link: str, single_tweet, force, selected_items):
+        """入队等待。若该链接曾经提交过（历史/队列中已有），则提到最前，提高排序"""
+        with self._lock:
+            boost = self._link_boost(task_id, link)
+            if boost:
+                self._task_order.insert(0, task_id)
+                if link:
+                    log_manager.info(task_id, '', f'已提交过的链接 @{link}，提高排序至队首', 'system')
+            else:
+                self._task_order.append(task_id)
+        self._dl_queue.put((task_id, single_tweet, force, selected_items))
+        self._ensure_worker()
+
+    def _link_boost(self, task_id: str, link: str) -> bool:
+        """判断该链接是否属于“曾经提交过”（队列中已有或历史已有其他任务），用于提高排序"""
+        if not link:
+            return False
+        with self._lock:
+            for tid, t in self._tasks.items():
+                if tid != task_id and getattr(t, 'link', '') == link:
+                    return True
+            for tid in self._task_order:
+                if tid == task_id:
+                    continue
+                t = self._tasks.get(tid)
+                if t and getattr(t, 'link', '') == link:
+                    return True
+        hist = database.get_last_download_by_link(link)
+        if hist and hist['task_id'] != task_id:
+            return True
+        return False
+
+    def preview_media(self, user_id: str, single_tweet: str = None, account_user_id: int = None) -> dict:
+        """只抓取媒体列表（不下载），供前端按需勾选。同步执行返回结果。"""
+        proxy = Config.get_proxy(user_id=account_user_id)
+        cookie = Config.get_cookie(user_id=account_user_id)
+
+        downloader = TwitterDownloader(
+            user_id=user_id,
+            download_path=Config.DOWNLOAD_FOLDER,
+            proxy=proxy,
+            cookie=cookie,
+            skip_existing=True,
+            use_name_scoped_dir=True
+        )
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            return loop.run_until_complete(downloader.preview_media(target_tweet_id=single_tweet))
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            raise
+        finally:
+            loop.close()
     
-    def _run_download(self, task_id: str):
+    def _ensure_worker(self):
+        """确保唯一的队列消费工作线程已启动"""
+        with self._worker_guard:
+            if self._worker_started:
+                return
+            self._worker_started = True
+            worker = threading.Thread(target=self._worker_loop, daemon=True)
+            worker.start()
+
+    def _worker_loop(self):
+        """串行消费全局下载队列"""
+        while True:
+            task_id, single_tweet, force, selected_items = self._dl_queue.get()
+            # 出队后从等待列表中移除
+            with self._lock:
+                if task_id in self._task_order:
+                    self._task_order.remove(task_id)
+            try:
+                task = self.get_task(task_id)
+                if task is None:
+                    continue
+                self._run_download(task_id, single_tweet, force, selected_items)
+            except Exception:
+                import traceback
+                traceback.print_exc()
+            finally:
+                self._dl_queue.task_done()
+
+    def queue_size(self) -> int:
+        """当前队列中等待执行的任务数（不含正在执行的任务）"""
+        return self._dl_queue.qsize()
+
+    def queue_list(self) -> dict:
+        """返回下载队列当前状态：正在执行 + 等待中 + 近期历史（含原始链接），支撑全局弹窗队列"""
+        waiting = []
+        running = []
+        with self._lock:
+            order = list(self._task_order)
+            for tid, t in list(self._tasks.items()):
+                if t.status == 'downloading':
+                    running.append({
+                        'task_id': tid,
+                        'user_id': t.user_id,
+                        'link': getattr(t, 'link', '') or '',
+                        'status': 'downloading',
+                        'progress': t.progress,
+                        'downloaded_files': t.downloaded_files,
+                        'total_files': t.total_files,
+                        'skipped_files': getattr(t, 'skipped_files', 0),
+                        'failed_files': getattr(t, 'failed_files', 0)
+                    })
+        for tid in order:
+            t = self.get_task(tid)
+            if t:
+                waiting.append({
+                    'task_id': tid,
+                    'user_id': t.user_id,
+                    'link': getattr(t, 'link', '') or '',
+                    'status': t.status or 'queued',
+                    'progress': 0,
+                    'downloaded_files': 0,
+                    'total_files': 0
+                })
+
+        # 近期历史（已完成/失败），供“重新下载”按钮使用
+        history = []
+        rows = database.get_download_history(limit=30) or []
+        for r in rows:
+            st = r.get('status') or ''
+            history.append({
+                'task_id': r.get('task_id', ''),
+                'user_id': r.get('user_id', ''),
+                'link': r.get('link') or '',
+                'status': st,
+                'progress': 100 if st == 'completed' else 0,
+                'downloaded_files': r.get('downloaded_files', 0),
+                'total_files': r.get('total_files', 0)
+            })
+        return {'running': running, 'waiting': waiting, 'history': history}
+
+    def re_download_task(self, task: DownloadTask, account_user_id: int = None) -> DownloadTask:
+        """重新下载一个历史任务：按存储的链接/用户重新入队（强制重新下载）"""
+        link = getattr(task, 'link', '') or ''
+        user_id = task.user_id
+        if link:
+            # 分享链接：按链接重新入队
+            m = re.search(r'(?:twitter\.com|x\.com)/([^/?]+)/status/(\d+)', link)
+            status_id = m.group(2) if m else None
+            return self.create_task(
+                user_id, 'all', account_user_id, export_xlsx=False, create_zip=True,
+                single_tweet=status_id, force=True, link=link
+            )
+        # 用户下载：全量重新下载
+        return self.create_task(user_id, 'all', account_user_id, export_xlsx=False, create_zip=True, force=True, link='')
+
+    def _run_download(self, task_id: str, single_tweet: str = None, force: bool = False, selected_items: list = None):
         """运行下载任务（在后台线程中执行）"""
         task = self.get_task(task_id)
         if not task:
@@ -101,15 +297,56 @@ class DownloadService:
         file_logger = DownloadLogger(task_id, task.user_id)
         
         try:
+            # 同一用户的任务串行执行，避免并发写同目录导致 WinError5
+            with self._user_locks_guard:
+                user_lock = self._user_locks.setdefault(task.user_id, threading.Lock())
+            user_lock.acquire()
+            try:
+                self._run_download_locked(task_id, task, file_logger, single_tweet, force, selected_items)
+            finally:
+                user_lock.release()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            task.status = 'failed'
+            task.error_message = str(e)
+            task.end_time = time.time()
+            
+            log_manager.error(task_id, task.user_id, f'任务失败: {str(e)}', 'system')
+            
+            # 更新数据库
+            database.update_download_history(
+                task_id,
+                status='failed',
+                error_message=str(e),
+                completed_at=time.strftime('%Y-%m-%d %H:%M:%S')
+            )
+        
+        finally:
+            # 清理内存中的任务（延迟清理，保持一段时间可查询）
+            def cleanup():
+                with self._lock:
+                    if task_id in self._tasks:
+                        del self._tasks[task_id]
+            timer = threading.Timer(3600, cleanup)  # 1小时后清理
+            timer.daemon = True
+            timer.start()
+
+    def _run_download_locked(self, task_id: str, task, file_logger, single_tweet: str = None, force: bool = False, selected_items: list = None):
+        """实际执行下载（已持用户串行锁）"""
+        try:
             task.status = 'downloading'
             database.update_download_history(task_id, status='downloading')
             log_manager.info(task_id, task.user_id, '开始下载...', 'system')
             
-            # 创建用户下载目录
-            user_download_path = os.path.join(Config.DOWNLOAD_FOLDER, task.user_id)
+            # 创建用户下载目录（根目录取自定义配置，规则: 指定目录/昵称(用户id)/媒体）
+            download_dir = database.get_config('download_dir', task.account_user_id)
+            root_download_dir = download_dir.strip() if download_dir else Config.DOWNLOAD_FOLDER
+            # 下载器内部会追加“昵称(用户id)”子目录，这里下载根目录即 download_dir
+            user_download_path = root_download_dir
             os.makedirs(user_download_path, exist_ok=True)
             task.download_path = user_download_path
-            log_manager.info(task_id, task.user_id, f'下载目录: {user_download_path}', 'system')
+            log_manager.info(task_id, task.user_id, f'下载根目录: {root_download_dir}', 'system')
             
             # 进度回调函数
             def progress_callback(progress: int, downloaded_files: int, total_files: int, skipped_files: int = 0):
@@ -144,8 +381,9 @@ class DownloadService:
                 task_id=task_id,
                 progress_callback=progress_callback,
                 user_info_callback=user_info_callback,
-                skip_existing=True,
-                max_retries=50
+                skip_existing=not force,  # 强制重新下载时忽略已存在文件
+                max_retries=50,
+                use_name_scoped_dir=True
             )
             
             # 将实时日志管理器传递给下载器
@@ -156,13 +394,20 @@ class DownloadService:
             asyncio.set_event_loop(loop)
             
             try:
-                result = loop.run_until_complete(downloader.start_download())
+                if selected_items:
+                    result = loop.run_until_complete(downloader.download_selected(selected_items))
+                elif single_tweet:
+                    result = loop.run_until_complete(downloader.start_download(single_tweet_id=single_tweet))
+                else:
+                    result = loop.run_until_complete(downloader.start_download())
+                # 媒体实际落在“昵称(用户id)”子目录，更新下载路径供ZIP打包使用
+                task.download_path = downloader.user_info.get('save_path') or user_download_path
                 downloaded = result.get('downloaded_files', 0)
                 skipped = result.get('skipped_files', 0)
                 failed = result.get('failed_files', 0)
                 
                 task.total_files = downloaded + skipped + failed
-                task.downloaded_files = downloaded + skipped  # 跳过的也算已完成
+                task.downloaded_files = downloaded  # 仅统计新增下载数；跳过数在 skipped_files，便于前端识别"全部已存在"
                 task.skipped_files = skipped
                 task.failed_files = failed
                 task.tweets_info = result.get('tweets_info', [])
@@ -213,6 +458,8 @@ class DownloadService:
             log_manager.success(task_id, task.user_id, '任务已完成!', 'system')
             
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             task.status = 'failed'
             task.error_message = str(e)
             task.end_time = time.time()

@@ -150,6 +150,12 @@ def init_db():
         if 'failed_files' not in columns:
             cursor.execute('ALTER TABLE download_history ADD COLUMN failed_files INTEGER DEFAULT 0')
         
+        # 迁移：为现有表添加 link 字段（记录原始提交链接）
+        if 'link' not in columns:
+            cursor.execute('ALTER TABLE download_history ADD COLUMN link TEXT')
+        cursor.execute('PRAGMA table_info(download_history)')
+        columns = [col['name'] for col in cursor.fetchall()]
+        
         # 创建默认超管账号 admin/123456
         cursor.execute('SELECT id FROM users WHERE username = ?', ('admin',))
         admin_user = cursor.fetchone()
@@ -168,6 +174,7 @@ def init_db():
             ('proxy', '', '代理地址（如: http://127.0.0.1:7890）'),
             ('auth_token', '', 'auth_token'),
             ('ct0', '', 'ct0'),
+            ('download_dir', '', '下载根目录（留空使用默认下载目录）'),
         ]
         
         for key, value, description in default_configs:
@@ -221,6 +228,7 @@ def get_all_configs(user_id: int = None) -> List[Dict[str, Any]]:
                 existing_keys = {cfg['key'] for cfg in configs}
                 default_configs = [
                     ('zip_delete_delay', '20', 'ZIP文件延迟删除时间（分钟）'),
+                    ('download_dir', '', '下载根目录（留空使用默认下载目录）'),
                 ]
                 
                 need_requery = False
@@ -261,7 +269,8 @@ def update_config(key: str, value: str, user_id: int = None):
                     'auth_token': 'auth_token',
                     'ct0': 'ct0',
                     'secret_key': 'Flask session密钥（自动生成）',
-                    'zip_delete_delay': 'ZIP文件延迟删除时间（分钟）'
+                    'zip_delete_delay': 'ZIP文件延迟删除时间（分钟）',
+                    'download_dir': '下载根目录（留空使用默认下载目录）'
                 }
                 description = descriptions.get(key, key)
                 cursor.execute('''
@@ -276,14 +285,25 @@ def update_config(key: str, value: str, user_id: int = None):
             ''', (value, key))
 
 
-def add_download_history(task_id: str, user_id: str, user_name: str = None, account_user_id: int = None):
+def add_download_history(task_id: str, user_id: str, user_name: str = None, account_user_id: int = None, link: str = None):
     """添加下载历史"""
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT INTO download_history (task_id, user_id, user_name, status, account_user_id)
-            VALUES (?, ?, ?, 'downloading', ?)
-        ''', (task_id, user_id, user_name, account_user_id))
+            INSERT INTO download_history (task_id, user_id, user_name, status, account_user_id, link)
+            VALUES (?, ?, ?, 'downloading', ?, ?)
+        ''', (task_id, user_id, user_name, account_user_id, link))
+
+
+def get_last_download_by_link(link: str) -> Optional[Dict[str, Any]]:
+    """按原始链接查找最近一次下载记录（用于提交过链接的排序提升）"""
+    if not link:
+        return None
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM download_history WHERE link = ? ORDER BY created_at DESC LIMIT 1', (link,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
 
 
 def update_download_history(task_id: str, **kwargs):
@@ -530,6 +550,7 @@ def create_user(username: str, password: str, nickname: str = None,
             ('proxy', '', '代理地址（如: http://127.0.0.1:7890）'),
             ('auth_token', '', 'auth_token'),
             ('ct0', '', 'ct0'),
+            ('download_dir', '', '下载根目录（留空使用默认下载目录）'),
         ]
         
         for key, value, description in default_configs:

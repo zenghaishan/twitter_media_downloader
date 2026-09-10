@@ -18,7 +18,8 @@ class TwitterDownloader:
                  progress_callback: Optional[Callable] = None,
                  user_info_callback: Optional[Callable] = None,
                  skip_existing: bool = True,
-                 max_retries: int = 50):
+                 max_retries: int = 50,
+                 use_name_scoped_dir: bool = False):
         self.user_id = user_id
         self.download_path = download_path
         self.proxy = proxy
@@ -28,6 +29,8 @@ class TwitterDownloader:
         self.user_info_callback = user_info_callback
         self.skip_existing = skip_existing
         self.max_retries = max_retries
+        # 是否使用 “昵称(用户id)” 命名的子目录作为最终保存目录
+        self.use_name_scoped_dir = use_name_scoped_dir
         
         # 初始化日志器
         self.logger = DownloadLogger(task_id or 'unknown', user_id) if task_id else None
@@ -130,6 +133,25 @@ class TwitterDownloader:
         if not self.skip_existing:
             return False
         return os.path.exists(file_path) and os.path.getsize(file_path) > 0
+
+    def _mkdir_retry(self, path: str, attempts: int = 5, delay: float = 0.8):
+        """创建目录，遇 Windows 瞬时占用/权限抖动时重试"""
+        for i in range(attempts):
+            try:
+                os.makedirs(path, exist_ok=True)
+                if i > 0:
+                    self._log('warning', f'目录创建重试成功({i}): {path}', 'system')
+                return
+            except PermissionError:
+                self._log('warning', f'目录创建被拒绝({i+1}/{attempts}): {path!r}', 'system')
+                if i == attempts - 1:
+                    raise
+                time.sleep(delay)
+            except OSError:
+                self._log('warning', f'目录创建OSError({i+1}/{attempts}): {path!r}', 'system')
+                if i == attempts - 1:
+                    raise
+                time.sleep(delay)
     
     @staticmethod
     def _format_size(size: int) -> str:
@@ -247,7 +269,7 @@ class TwitterDownloader:
                                 for idx, _media in enumerate(media_list):
                                     if 'video_info' in _media and self.has_video:
                                         url = self.get_heighest_video_quality(_media['video_info']['variants'])
-                                        photo_lst.append((url, date_str, tweet_id, idx, len(media_list), [tweet_msecs, name, f'@{screen_name}', _media['expanded_url'], 'Video', url, '', a['full_text']]))
+                                        photo_lst.append((url, date_str, tweet_id, idx, len(media_list), [tweet_msecs, name, f'@{screen_name}', _media['expanded_url'], 'Video', url, _media['media_url_https'], a['full_text']]))
                                         self.tweets_info.append({'time': timestr, 'name': name, 'screen_name': f'@{screen_name}', 'text': a['full_text'], 'type': 'Video', 'media_url': _media['expanded_url'], 'download_url': url})
                                     else:
                                         url = _media['media_url_https']
@@ -263,7 +285,7 @@ class TwitterDownloader:
                                 for idx, _media in enumerate(media_list):
                                     if 'video_info' in _media and self.has_video:
                                         url = self.get_heighest_video_quality(_media['video_info']['variants'])
-                                        photo_lst.append((url, date_str, tweet_id, idx, len(media_list), [tweet_msecs, name, f"@{screen_name}", _media['expanded_url'], 'Video', url, '', full_text]))
+                                        photo_lst.append((url, date_str, tweet_id, idx, len(media_list), [tweet_msecs, name, f"@{screen_name}", _media['expanded_url'], 'Video', url, _media['media_url_https'], full_text]))
                                         self.tweets_info.append({'time': timestr, 'name': name, 'screen_name': f'@{screen_name}', 'text': full_text, 'type': 'Video', 'media_url': _media['expanded_url'], 'download_url': url})
                                     else:
                                         url = _media['media_url_https']
@@ -295,7 +317,7 @@ class TwitterDownloader:
                             for idx, _media in enumerate(media_list):
                                 if 'video_info' in _media and self.has_video:
                                     url = self.get_heighest_video_quality(_media['video_info']['variants'])
-                                    photo_lst.append((url, date_str, tweet_id, idx, len(media_list), [tweet_msecs, self.user_info['name'], f'@{self.user_info["screen_name"]}', _media['expanded_url'], 'Video', url, '', a['full_text']]))
+                                    photo_lst.append((url, date_str, tweet_id, idx, len(media_list), [tweet_msecs, self.user_info['name'], f'@{self.user_info["screen_name"]}', _media['expanded_url'], 'Video', url, _media['media_url_https'], a['full_text']]))
                                     self.tweets_info.append({'time': timestr, 'name': self.user_info['name'], 'screen_name': f'@{self.user_info["screen_name"]}', 'text': a['full_text'], 'type': 'Video', 'media_url': _media['expanded_url'], 'download_url': url})
                                 else:
                                     url = _media['media_url_https']
@@ -310,7 +332,7 @@ class TwitterDownloader:
         
         return photo_lst
     
-    async def get_download_url(self):
+    async def get_download_url(self, target_tweet_id: str = None):
         if self.has_highlights:
             url_top = f'https://twitter.com/i/api/graphql/w9-i9VNm_92GYFaiyGT1NA/UserHighlightsTweets?variables={{"userId":"{self.user_info["rest_id"]}","count":20,'
             url_bottom = '"includePromotedContent":true,"withVoice":true}&features={"responsive_web_graphql_exclude_directive_enabled":true,"verified_phone_label_enabled":false,"creator_subscriptions_tweet_preview_api_enabled":true,"responsive_web_graphql_timeline_navigation_enabled":true,"responsive_web_graphql_skip_user_profile_image_extensions_enabled":false,"c9s_tweet_anatomy_moderator_badge_enabled":true,"tweetypie_unmention_optimization_enabled":true,"responsive_web_edit_tweet_api_enabled":true,"graphql_is_translatable_rweb_tweet_is_translatable_enabled":true,"view_counts_everywhere_api_enabled":true,"longform_notetweets_consumption_enabled":true,"responsive_web_twitter_article_tweet_consumption_enabled":false,"tweet_awards_web_tipping_enabled":false,"freedom_of_speech_not_reach_fetch_enabled":true,"standardized_nudges_misinfo":true,"tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled":true,"rweb_video_timestamps_enabled":true,"longform_notetweets_rich_text_read_enabled":true,"longform_notetweets_inline_media_enabled":true,"responsive_web_media_download_video_enabled":false,"responsive_web_enhance_cards_enabled":false}'
@@ -389,6 +411,23 @@ class TwitterDownloader:
         
         return photo_lst
     
+    @staticmethod
+    def _parse_media_identity(url: str):
+        """从媒体URL解析稳定的 媒体ID 与 清晰度。
+        视频: .../vid/avc1/{w}x{h}/{hash}.mp4  → 媒体ID=文件哈希名, 清晰度=分辨率
+        图片: .../media/{media_id}.{ext}
+        同一媒体源在推文中多次出现时返回相同ID，作为目录内去重键。
+        返回 (media_id_or_None, quality_or_None)
+        """
+        m = re.search(r'/vid/(?:avc1|hevc|[a-z0-9]+)/(\d+)x(\d+)/([A-Za-z0-9_-]+)\.mp4', url)
+        if m:
+            # 按实际清晰度标注：取短边作为p值（1200x540→540p，540x1200→540p）
+            return m.group(3), f'{min(int(m.group(1)), int(m.group(2)))}p'
+        m = re.search(r'/media/([A-Za-z0-9_-]+)\.', url)
+        if m:
+            return m.group(1), 'orig'
+        return None, None
+
     async def download_file(self, url: str, date_str: str, tweet_id: str, media_index: int, media_count: int, csv_info: list, order: int):
         # 获取文件扩展名
         if '.mp4' in url:
@@ -403,13 +442,18 @@ class TwitterDownloader:
                 print(url)
                 return False
         
-        # 构建文件名
-        if media_count == 1:
-            # 单个文件：{date}_{tweet_id}.ext
-            file_name = f'{self.user_info["save_path"]}/{date_str}_{tweet_id}.{ext}'
+        # 构建文件名：优先使用 媒体ID_清晰度（同一媒体在同用户目录内天然去重）；
+        # 解析失败时回退到 日期_推文ID_序号
+        media_id, quality = self._parse_media_identity(url)
+        if media_id:
+            file_name = f'{self.user_info["save_path"]}/{media_id}_{quality}.{ext}'
         else:
-            # 多个文件：{date}_{tweet_id}_{index+1}.ext
-            file_name = f'{self.user_info["save_path"]}/{date_str}_{tweet_id}_{media_index + 1}.{ext}'
+            if media_count == 1:
+                # 单个文件：{date}_{tweet_id}.ext
+                file_name = f'{self.user_info["save_path"]}/{date_str}_{tweet_id}.{ext}'
+            else:
+                # 多个文件：{date}_{tweet_id}_{index+1}.ext
+                file_name = f'{self.user_info["save_path"]}/{date_str}_{tweet_id}_{media_index + 1}.{ext}'
         
         # 检查文件是否已存在
         if self._file_exists(file_name):
@@ -425,48 +469,59 @@ class TwitterDownloader:
         if '.mp4' not in url and self.orig_format:
             url += '?name=orig'
         
+        # 1) 下载媒体到内存（仅网络失败才重试）
+        content = None
+        effective_url = url
         count = 0
         while True:
             try:
                 async with self._get_client() as client:
-                    response = await client.get(self.quote_url(url), timeout=(3.05, 16))
+                    response = await client.get(self.quote_url(effective_url), timeout=(3.05, 16))
                     if response.status_code == 404:
                         raise Exception('404')
-                    self.down_count += 1
-                    self.downloaded_files += 1
-                    
-                    # 记录下载成功
-                    file_size = len(response.content)
-                    size_str = self._format_size(file_size)
-                    self._log('success', f'[下载成功] {os.path.basename(file_name)} ({size_str})', 'download')
-                    
-                    # 更新进度
-                    if self.progress_callback:
-                        progress = min(int(((self.downloaded_files + self.skipped_files) / max(self.total_files, 1)) * 100), 100)
-                        self.progress_callback(progress, self.downloaded_files, self.total_files, self.skipped_files)
-                
-                with open(file_name, 'wb') as f:
-                    f.write(response.content)
-                
-                break
+                    content = response.content
+                    break
             except Exception as e:
-                if '.mp4' in url or self.orig_format or str(e) != "404":
+                if '.mp4' in effective_url or self.orig_format or str(e) != "404":
                     count += 1
                     if count >= self.max_retries:
                         self.failed_files += 1
                         self._log('error', f'[下载失败] {os.path.basename(file_name)} - 错误: {e} (已重试{count}次)', 'download')
-                        break
+                        return False
                     self._log('warning', f'[重试] {os.path.basename(file_name)} - 第{count}/{self.max_retries}次重试', 'download')
                 else:
-                    url = url.replace('name=orig', 'name=4096x4096')
+                    effective_url = effective_url.replace('name=orig', 'name=4096x4096')
+        
+        # 2) 写盘（本地磁盘失败直接记为失败，不触发网络重试，避免计数虚增与刷屏）
+        try:
+            with open(file_name, 'wb') as f:
+                f.write(content)
+        except Exception as e:
+            self.failed_files += 1
+            self._log('error', f'[写入失败] {os.path.basename(file_name)} - 错误: {e}', 'download')
+            return False
+        
+        # 3) 真正落盘成功后才累计下载数
+        self.down_count += 1
+        self.downloaded_files += 1
+        file_size = len(content)
+        size_str = self._format_size(file_size)
+        self._log('success', f'[下载成功] {os.path.basename(file_name)} ({size_str})', 'download')
+        
+        # 更新进度
+        if self.progress_callback:
+            progress = min(int(((self.downloaded_files + self.skipped_files) / max(self.total_files, 1)) * 100), 100)
+            self.progress_callback(progress, self.downloaded_files, self.total_files, self.skipped_files)
+        
+        return True
     
-    async def download_control(self):
+    async def download_control(self, target_tweet_id: str = None):
         page_count = 0
         while True:
-            photo_lst = await self.get_download_url()
+            photo_lst = await self.get_download_url(target_tweet_id)
             
-            # 没有更多数据
-            if photo_lst is None:
+            # 没有更多数据，或 API 异常(返回False)，终止翻页
+            if photo_lst is None or photo_lst is False:
                 break
             
             # 空列表或只有True标记，继续下一页
@@ -475,6 +530,12 @@ class TwitterDownloader:
             
             page_count += 1
             self._log('info', f'开始处理第 {page_count} 页，包含 {len(photo_lst)} 个媒体文件', 'system')
+            
+            # 若指定了目标推文，只保留该推文的媒体；本页没有则继续翻页
+            if target_tweet_id is not None:
+                photo_lst = [it for it in photo_lst if str(it[2]) == str(target_tweet_id)]
+                if not photo_lst:
+                    continue
             
             tasks = []
             for order, item in enumerate(photo_lst):
@@ -488,22 +549,126 @@ class TwitterDownloader:
             # 记录进度
             if self.logger:
                 self.logger.log_progress(self.downloaded_files, self.downloaded_files + self.skipped_files + self.failed_files, self.skipped_files)
+            
+            # 单推文场景：目标推文已下载完毕，立即终止翻页，避免重复下载与计数虚增
+            if target_tweet_id is not None:
+                break
     
-    async def start_download(self):
-        """开始下载任务"""
+    async def preview_media(self, target_tweet_id: str = None):
+        """只抓取并返回媒体列表（不下载）。返回值供前端选择后按需下载。"""
+        items = []
+        if not await self.get_other_info():
+            raise Exception('获取用户信息失败')
+        page_count = 0
+        while True:
+            photo_lst = await self.get_download_url(target_tweet_id)
+            if photo_lst is None or photo_lst is False:
+                break
+            if not photo_lst or (len(photo_lst) == 1 and photo_lst[0] == True):
+                continue
+            page_count += 1
+            if target_tweet_id is not None:
+                photo_lst = [it for it in photo_lst if str(it[2]) == str(target_tweet_id)]
+                if not photo_lst:
+                    continue
+            for item in photo_lst:
+                url, date_str, tid, midx, mcnt, csv = item[0], item[1], item[2], item[3], item[4], item[5]
+                media_id, quality = self._parse_media_identity(url)
+                ext = ('mp4' if '.mp4' in url else (csv[5][-3:] if csv and len(csv) > 5 else ''))
+                thumb_url = url
+                if '.mp4' in url:
+                    thumb_url = csv[6] if csv and len(csv) > 6 and csv[6] else None
+                items.append({
+                    'url': url,
+                    'date_str': date_str,
+                    'tweet_id': str(tid),
+                    'media_index': midx,
+                    'media_count': mcnt,
+                    'csv_info': csv,
+                    'media_id': media_id or '',
+                    'quality': quality or '',
+                    'type': 'video' if '.mp4' in url else 'image',
+                    'thumb_url': thumb_url
+                })
+            if target_tweet_id is not None:
+                break
+        return {
+            'user_name': self.user_info.get('name'),
+            'screen_name': self.user_info.get('screen_name', self.user_id),
+            'items': items
+        }
+
+    async def download_selected(self, items):
+        """按选中的媒体项（列表）下载"""
+        start_time = time.time()
+        os.makedirs(self.download_path, exist_ok=True)
+        if not await self.get_other_info():
+            raise Exception('获取用户信息失败')
+        if self.use_name_scoped_dir and self.user_info.get('name'):
+            display_name = re.sub(r'[/\\:*?"<>|]', '_', str(self.user_info['name'])).strip().rstrip('. ')
+            folder = f'{display_name}({self.user_info["screen_name"]})'
+            self.user_info['save_path'] = os.path.join(self.download_path, folder)
+            self._mkdir_retry(self.download_path)
+            self._mkdir_retry(self.user_info['save_path'])
+            self._log('info', f'保存目录: {self.user_info["save_path"]}', 'system')
+
+        download_tasks = []
+        for order, item in enumerate(items):
+            url = item.get('url')
+            if not url:
+                continue
+            csv_info = item.get('csv_info') or [None, '', '', '', None, url, '', '']
+            download_tasks.append(self.download_file(
+                url,
+                str(item.get('date_str', '')),
+                str(item.get('tweet_id', '')),
+                int(item.get('media_index', 0) or 0),
+                int(item.get('media_count', 1) or 1),
+                csv_info,
+                order
+            ))
+        await asyncio.gather(*download_tasks)
+        total_time = time.time() - start_time
+        self._log('info', f'下载完成 - 成功: {self.downloaded_files}, 失败: {self.failed_files}, 跳过: {self.skipped_files}, 耗时: {total_time:.1f}秒', 'system')
+        return {
+            'user_name': self.user_info['name'],
+            'avatar_url': self.user_info['avatar_url'],
+            'media_count': self.user_info['media_count'],
+            'downloaded_files': self.downloaded_files,
+            'skipped_files': self.skipped_files,
+            'failed_files': self.failed_files,
+            'request_count': self.request_count,
+            'total_time': total_time,
+            'tweets_info': self.tweets_info
+        }
+
+    async def start_download(self, single_tweet_id: str = None):
+        """开始下载任务
+        single_tweet_id: 若提供，仅下载该推文ID下的所有媒体
+        """
         start_time = time.time()
         
-        # 创建下载目录
+        # 创建下载根目录
         os.makedirs(self.download_path, exist_ok=True)
         
-        self._log('info', f'下载目录: {self.download_path}', 'system')
+        self._log('info', f'下载根目录: {self.download_path}', 'system')
         
         # 获取用户信息
         if not await self.get_other_info():
             raise Exception('获取用户信息失败')
         
+        # 若开启了“昵称(用户id)”子目录规则，在拿到昵称后确定最终保存目录
+        if self.use_name_scoped_dir and self.user_info.get('name'):
+            display_name = re.sub(r'[/\\:*?"<>|]', '_', str(self.user_info['name'])).strip().rstrip('. ')
+            folder = f'{display_name}({self.user_info["screen_name"]})'
+            self.user_info['save_path'] = os.path.join(self.download_path, folder)
+            # Windows 下目录可能被瞬时占用/杀软锁定，做一次带重试的创建
+            self._mkdir_retry(self.download_path)
+            self._mkdir_retry(self.user_info['save_path'])
+            self._log('info', f'保存目录: {self.user_info["save_path"]}', 'system')
+        
         # 开始下载
-        await self.download_control()
+        await self.download_control(target_tweet_id=single_tweet_id)
         
         # 计算总耗时
         total_time = time.time() - start_time

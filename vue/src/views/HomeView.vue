@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import Navbar from '../components/Navbar.vue'
 import PageHeader from '../components/PageHeader.vue'
 import i18n from '../utils/i18n'
@@ -9,6 +9,7 @@ import { ElMessage } from 'element-plus'
 const t = (key: string, params: Record<string, any> = {}) => i18n.t(key, params)
 
 const userId = ref('')
+const shareUrl = ref('')
 const taskId = ref('')
 const status = ref('pending')
 const progress = ref(0)
@@ -17,6 +18,14 @@ const downloadedFiles = ref(0)
 const elapsedTime = ref('0' + t('time.seconds'))
 const errorMessage = ref('')
 const isDownloading = ref(false)
+const queueCount = ref(0)
+const force = ref(false)
+const selective = ref(false)
+const previewing = ref(false)
+const previewUser = ref('')
+const previewScreen = ref('')
+const selectiveItems = ref<any[]>([])
+const selectedIds = ref<Set<string>>(new Set())
 
 let progressInterval: ReturnType<typeof setInterval> | null = null
 let timeInterval: ReturnType<typeof setInterval> | null = null
@@ -44,11 +53,36 @@ const fetchProgress = async () => {
       status.value = data.status
       progress.value = data.progress
       totalFiles.value = data.total_files
-      downloadedFiles.value = data.downloaded_files
+      downloadedFiles.value = data.downloaded_files || 0
+      const skippedFiles = data.skipped_files || 0
       errorMessage.value = data.error_message || ''
-      if (data.status === 'completed' || data.status === 'failed') {
+
+      // 全部文件已存在：立即提示并结束任务
+      if (totalFiles.value > 0 && downloadedFiles.value === 0 && skippedFiles === totalFiles.value) {
         isDownloading.value = false
         stopTimers()
+        status.value = 'completed'
+        ElMessage.info({
+          message: `全部${totalFiles.value}个文件已存在，跳过下载`,
+          duration: 2500,
+          showClose: false
+        })
+      } else if (data.status === 'completed' || data.status === 'failed') {
+        isDownloading.value = false
+        stopTimers()
+        if (skippedFiles > 0 && downloadedFiles.value === 0) {
+          ElMessage.info({
+            message: `下载完成，共跳过${skippedFiles}个已存在文件`,
+            duration: 2500,
+            showClose: false
+          })
+        } else if (downloadedFiles.value > 0) {
+          ElMessage.success({
+            message: `下载完成，新增${downloadedFiles.value}，跳过${skippedFiles}`,
+            duration: 2500,
+            showClose: false
+          })
+        }
       }
     }
   } catch (error) {
@@ -77,7 +111,8 @@ const startDownload = async () => {
       body: JSON.stringify({ 
         user_id: userId.value.trim(),
         download_type: 'all',
-        export_xlsx: true
+        export_xlsx: true,
+        force: force.value
       })
     })
     const data = await response.json()
@@ -96,6 +131,58 @@ const startDownload = async () => {
         return
       }
       ElMessage.success(data.message)
+    } else {
+      ElMessage.error(data.error || t('home.downloadFailed'))
+      isDownloading.value = false
+    }
+  } catch (error) {
+    ElMessage.error(t('home.requestFailed') + (error as Error).message)
+    isDownloading.value = false
+  }
+}
+
+const startShareDownload = async () => {
+  if (!shareUrl.value.trim()) {
+    ElMessage.warning(t('home.enterUserId'))
+    return
+  }
+  // 支持持续添加链接：即使有任务在跑/排队也允许继续入队，新链接自动进入下载队列
+  if (progressInterval) stopTimers()
+  isDownloading.value = true
+  status.value = 'queued'
+  progress.value = 0
+  totalFiles.value = 0
+  downloadedFiles.value = 0
+  errorMessage.value = ''
+  elapsedTime.value = '0' + t('time.seconds')
+  startTime = new Date()
+
+  try {
+    const response = await fetch('/api/download-share', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: shareUrl.value.trim(), force: force.value })
+    })
+    const data = await response.json()
+    if (response.ok && data.task_id) {
+      taskId.value = data.task_id
+      queueCount.value = data.queue_size || 0
+      if (queueCount.value > 1) {
+        ElMessage.success({
+          message: `已加入下载队列，前面还有 ${queueCount.value - 1} 个任务`,
+          duration: 2500,
+          showClose: false
+        })
+      } else {
+        ElMessage.success({
+          message: data.message || '已开始解析下载',
+          duration: 2500,
+          showClose: false
+        })
+      }
+      progressInterval = setInterval(fetchProgress, 1000)
+      timeInterval = setInterval(updateElapsedTime, 1000)
+      shareUrl.value = '' // 清空输入框，便于继续添加下一个链接
     } else {
       ElMessage.error(data.error || t('home.downloadFailed'))
       isDownloading.value = false
@@ -125,7 +212,133 @@ const downloadZip = async () => {
   }
 }
 
-onUnmounted(() => stopTimers())
+const selectedCount = computed(() => selectedIds.value.size)
+const allSelected = computed(() => selectiveItems.value.length > 0 && selectedIds.value.size === selectiveItems.value.length)
+
+const toggleItem = (key: string) => {
+  const next = new Set(selectedIds.value)
+  if (next.has(key)) next.delete(key)
+  else next.add(key)
+  selectedIds.value = next
+}
+
+const toggleAll = () => {
+  if (allSelected.value) selectedIds.value = new Set()
+  else selectedIds.value = new Set(selectiveItems.value.map(it => it.key))
+}
+
+const fetchPreview = async () => {
+  const url = shareUrl.value.trim()
+  if (!url) {
+    ElMessage.warning(t('home.enterUserId'))
+    return
+  }
+  previewing.value = true
+  try {
+    const response = await fetch('/api/preview-media', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url })
+    })
+    const data = await response.json()
+    if (response.ok) {
+      previewUser.value = data.user_name || ''
+      previewScreen.value = data.screen_name || ''
+      selectiveItems.value = (data.items || []).map((it: any) => ({
+        ...it,
+        key: `${it.tweet_id}_${it.media_index}_${it.media_id || it.url}`
+      }))
+      selectedIds.value = new Set()
+      if (!selectiveItems.value.length) {
+        ElMessage.warning('该链接未抓取到可下载的媒体文件')
+      } else {
+        ElMessage.success(`已抓取 ${selectiveItems.value.length} 个文件，请勾选后下载`)
+      }
+    } else {
+      ElMessage.error(data.error || '抓取媒体列表失败')
+    }
+  } catch (error) {
+    ElMessage.error(t('home.requestFailed') + (error as Error).message)
+  } finally {
+    previewing.value = false
+  }
+}
+
+const downloadSelected = async () => {
+  const screen = previewScreen.value
+  if (!screen) {
+    ElMessage.warning('请先抓取媒体列表')
+    return
+  }
+  if (selectedIds.value.size === 0) {
+    ElMessage.warning('请至少选择一个文件')
+    return
+  }
+  const items = selectiveItems.value.filter(it => selectedIds.value.has(it.key))
+  isDownloading.value = true
+  status.value = 'queued'
+  progress.value = 0
+  totalFiles.value = 0
+  downloadedFiles.value = 0
+  errorMessage.value = ''
+  elapsedTime.value = '0' + t('time.seconds')
+  startTime = new Date()
+
+  try {
+    const response = await fetch('/api/download-selected', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        user_id: screen,
+        items: items.map(({ url, date_str, tweet_id, media_index, media_count, csv_info }) => ({
+          url, date_str, tweet_id, media_index, media_count, csv_info
+        })),
+        force: force.value
+      })
+    })
+    const data = await response.json()
+    if (response.ok && data.task_id) {
+      taskId.value = data.task_id
+      queueCount.value = data.queue_size || 0
+      ElMessage.success(data.message || `已入队下载 ${data.count || items.length} 个文件`)
+      progressInterval = setInterval(fetchProgress, 1000)
+      timeInterval = setInterval(updateElapsedTime, 1000)
+    } else {
+      ElMessage.error(data.error || t('home.downloadFailed'))
+      isDownloading.value = false
+    }
+  } catch (error) {
+    ElMessage.error(t('home.requestFailed') + (error as Error).message)
+    isDownloading.value = false
+  }
+}
+
+const onImgError = (e: Event) => {
+  const el = e.target as HTMLElement
+  el.style.display = 'none'
+}
+
+const mediaPreviewUrl = (it: any) => {
+  if (it.type === 'image') return it.url
+  return it.thumb_url || ''
+}
+
+const thumbUrl = (it: any) => {
+  const src = mediaPreviewUrl(it)
+  if (!src) return ''
+  return `/api/thumb?url=${encodeURIComponent(src)}&screen=${encodeURIComponent(previewScreen.value)}`
+}
+
+const mediaLabel = (it: any) => {
+  if (it.type === 'video') return '视频'
+  return '图片'
+}
+
+onMounted(() => {
+})
+onUnmounted(() => {
+  stopTimers()
+})
 </script>
 
 <template>
@@ -192,6 +405,116 @@ onUnmounted(() => stopTimers())
       </div>
     </div>
     
+    <div class="input-section">
+      <div class="input-wrapper">
+        <div class="input-field-wrapper">
+          <div class="input-label">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71"/>
+              <path d="M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71"/>
+            </svg>
+            分享链接下载（支持 x.com / twitter.com 链接）
+          </div>
+          <div class="input-row">
+            <div class="input-icon-wrapper">
+              <input 
+                type="text" 
+                class="input-field" 
+                v-model="shareUrl" 
+                placeholder="例如: https://x.com/yykfPro/status/2097616305608393046?s=20"
+                @keyup.enter="selective ? fetchPreview() : startShareDownload()"
+                :disabled="selective && previewing"
+              >
+            </div>
+            <button 
+              class="download-btn"
+              :class="{ loading: isDownloading || (selective && previewing) }"
+              :disabled="!shareUrl.trim() || (selective && previewing)"
+              @click="selective ? fetchPreview() : startShareDownload()"
+            >
+              <span v-if="isDownloading || (selective && previewing)" class="btn-spinner"></span>
+              <svg v-else width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                <path d="M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71"/>
+                <path d="M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71"/>
+              </svg>
+              {{ selective ? '抓取并选择' : '解析并下载' }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+    
+    <!-- 下载选项 -->
+    <div class="input-section">
+      <div class="input-wrapper">
+        <div style="display:flex;align-items:center;gap:10px;padding:4px 2px;">
+          <el-switch v-model="force" size="small" active-text="强制" />
+          <span style="font-size:14px;color:#333;">强制重新下载（忽略已存在文件，覆盖同名文件）</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:10px;padding:4px 2px;">
+          <el-switch v-model="selective" size="small" active-text="选择性" />
+          <span style="font-size:14px;color:#333;">选择性下载（抓取推文下的文件，按需勾选下载）</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 选择性下载面板 -->
+    <div class="input-section" v-if="selective">
+      <div class="selective-panel">
+        <div class="input-label">选择性下载</div>
+
+        <template v-if="selectiveItems.length">
+          <div class="preview-toolbar">
+            <div style="display:flex;align-items:center;gap:6px;font-size:13px;color:#555;">
+              <span>{{ previewScreen ? '@' + previewScreen : '' }} · {{ selectiveItems.length }} 个文件</span>
+            </div>
+            <div style="display:flex;align-items:center;gap:12px;">
+              <label style="display:flex;align-items:center;gap:5px;font-size:13px;color:#555;cursor:pointer;">
+                <el-checkbox :model-value="allSelected" @change="toggleAll" size="small" />
+                全选
+              </label>
+              <button class="select-download-btn" :disabled="!selectedCount" @click="downloadSelected">
+                下载选中（{{ selectedCount }}）
+              </button>
+            </div>
+          </div>
+
+          <div class="preview-grid">
+            <div
+              v-for="it in selectiveItems"
+              :key="it.key"
+              class="preview-card"
+              :class="{ 'is-checked': selectedIds.has(it.key) }"
+              @click="toggleItem(it.key)"
+            >
+              <div class="preview-thumb">
+                <svg v-if="it.type === 'video'" class="preview-cover-fallback" width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                  <rect x="2" y="2" width="20" height="20" rx="2.18"/><path d="M10 8l5 4-5 4V8z"/>
+                </svg>
+                <img
+                  v-if="mediaPreviewUrl(it)"
+                  class="preview-cover-img"
+                  :src="thumbUrl(it)"
+                  referrerpolicy="no-referrer"
+                  loading="lazy"
+                  alt="预览"
+                  @error="onImgError"
+                >
+                <span class="preview-type" :class="it.type">{{ mediaLabel(it) }} {{ it.quality }}</span>
+              </div>
+              <div class="preview-check">
+                <el-checkbox :model-value="selectedIds.has(it.key)" size="small" />
+              </div>
+            </div>
+          </div>
+        </template>
+
+        <div v-else style="font-size:13px;color:#aaa;padding:10px 2px;">
+          在上方「分享链接下载」输入链接，点击「抓取并选择」即可预览推文下的全部文件并勾选下载
+        </div>
+      </div>
+    </div>
+
     <div v-if="taskId" class="progress-section">
       <div class="progress-header">
         <h3 class="progress-title">{{ t('home.downloadProgress') }}</h3>
@@ -204,6 +527,10 @@ onUnmounted(() => stopTimers())
         <div class="progress-percentage">{{ progress }}%</div>
       </div>
       <div class="progress-info">
+        <div class="progress-item" v-if="queueCount > 0">
+          <div class="progress-item-label">队列等待</div>
+          <div class="progress-item-value">{{ queueCount - 1 }}</div>
+        </div>
         <div class="progress-item">
           <div class="progress-item-label">{{ t('home.downloaded') }}</div>
           <div class="progress-item-value">{{ downloadedFiles }}</div>
@@ -295,4 +622,100 @@ onUnmounted(() => stopTimers())
 </template>
 
 <style scoped>
+.selective-panel {
+  width: 100%;
+}
+.preview-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: 8px 0 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid #f0f0f0;
+}
+.preview-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  gap: 12px;
+  margin-top: 14px;
+}
+.preview-card {
+  position: relative;
+  border: 2px solid #e5e7eb;
+  border-radius: 10px;
+  overflow: hidden;
+  cursor: pointer;
+  background: #fafafa;
+  transition: border-color 0.2s, box-shadow 0.2s;
+  user-select: none;
+}
+.preview-card:hover {
+  border-color: #c3cffe;
+}
+.preview-card.is-checked {
+  border-color: #4A6CF7;
+  box-shadow: 0 0 0 2px rgba(74,108,247,0.15);
+}
+.preview-thumb {
+  position: relative;
+  width: 100%;
+  height: 110px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: linear-gradient(135deg, #f1f3fa, #e6ebff);
+  overflow: hidden;
+}
+.preview-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.preview-cover-img {
+  position: relative;
+  z-index: 1;
+}
+.preview-cover-fallback {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  color: rgba(74, 108, 247, 0.75);
+  pointer-events: none;
+}
+.preview-type {
+  position: absolute;
+  left: 6px;
+  bottom: 6px;
+  padding: 1px 7px;
+  border-radius: 8px;
+  font-size: 11px;
+  color: #fff;
+  background: rgba(0,0,0,0.55);
+  backdrop-filter: blur(2px);
+}
+.preview-check {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  background: rgba(255,255,255,0.9);
+  border-radius: 6px;
+  padding: 1px;
+}
+.select-download-btn {
+  border: none;
+  background: #4A6CF7;
+  color: #fff;
+  font-size: 13px;
+  padding: 7px 14px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+.select-download-btn:hover:not(:disabled) {
+  background: #3b5ae0;
+}
+.select-download-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
 </style>

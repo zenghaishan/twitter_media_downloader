@@ -27,6 +27,82 @@ const filters = ref({
 
 const totalPages = computed(() => Math.ceil(total.value / pageSize.value))
 
+/* ===== 下载管理：实时队列（进行中 / 排队） ===== */
+const queueRunning = ref<any[]>([])
+const queueWaiting = ref<any[]>([])
+const redoLoading = ref(false)
+let queueInterval: ReturnType<typeof setInterval> | null = null
+
+const hasActiveQueue = computed(() => queueRunning.value.length + queueWaiting.value.length > 0)
+
+const qsText = (s: string) => {
+  switch (s) {
+    case 'downloading': return '下载中'
+    case 'queued': return '等待中'
+    case 'completed': return '已完成'
+    case 'failed': return '失败'
+    default: return getStatusText(s)
+  }
+}
+const qsClass = (s: string) => {
+  switch (s) {
+    case 'downloading': return 'q-status-downloading'
+    case 'queued': return 'q-status-queued'
+    case 'completed': return 'q-status-completed'
+    case 'failed': return 'q-status-failed'
+    default: return ''
+  }
+}
+const linkLabel = (item: any) => {
+  const link = item.link || ''
+  if (link) {
+    try { return link.replace(/^https?:\/\/(x|twitter)\.com\//, '') } catch (e) { return link }
+  }
+  return item.user_id ? '@' + item.user_id : ''
+}
+const rowProgress = (item: any) => {
+  if ((item.status === 'downloading' || item.status === 'queued') && item.total_files) {
+    return Math.round((item.downloaded_files / item.total_files) * 100)
+  }
+  return item.status === 'completed' ? 100 : 0
+}
+const fetchQueue = async () => {
+  try {
+    const response = await fetch('/api/download-queue')
+    if (response.ok) {
+      const data = await response.json()
+      queueRunning.value = data.running || []
+      queueWaiting.value = data.waiting || []
+    }
+  } catch (e) {
+    // 忽略网络错误，保持安静轮询
+  }
+}
+const redownload = async (item: any) => {
+  if (redoLoading.value) return
+  redoLoading.value = true
+  try {
+    const response = await fetch('/api/re-download', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ task_id: item.task_id })
+    })
+    const data = await response.json()
+    if (response.ok && data.task_id) {
+      ElMessage.success(data.message || '已重新入队下载')
+      fetchQueue()
+      fetchHistory(currentPage.value, false)
+    } else {
+      ElMessage.error(data.error || '重新下载失败')
+    }
+  } catch (error) {
+    ElMessage.error(t('home.requestFailed') + (error as Error).message)
+  } finally {
+    redoLoading.value = false
+  }
+}
+/* ===== 下载管理：实时队列 ===== */
+
 const debounceSearch = debounce(() => {
   fetchHistory(1)
 })
@@ -230,15 +306,22 @@ const fetchUser = async () => {
 onMounted(() => {
   fetchUser()
   fetchHistory()
+  fetchQueue()
   refreshInterval = setInterval(() => {
     fetchHistory(currentPage.value, false)
-  }, 5000)
+    fetchQueue()
+  }, 3000)
+  queueInterval = setInterval(fetchQueue, 3000)
 })
 
 onUnmounted(() => {
   if (refreshInterval) {
     clearInterval(refreshInterval)
     refreshInterval = null
+  }
+  if (queueInterval) {
+    clearInterval(queueInterval)
+    queueInterval = null
   }
 })
 </script>
@@ -260,6 +343,60 @@ onUnmounted(() => {
         {{ t('history.clearCache') }}
       </button>
     </PageHeader>
+    
+    <!-- 下载管理：实时队列（进行中 / 排队） -->
+    <div v-if="hasActiveQueue" class="history-card queue-panel">
+      <div class="queue-panel-head">
+        <span class="queue-panel-title">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+            <rect x="3" y="3" width="7" height="7" rx="1.5"/>
+            <rect x="14" y="3" width="7" height="7" rx="1.5"/>
+            <rect x="3" y="14" width="7" height="7" rx="1.5"/>
+            <rect x="14" y="14" width="7" height="7" rx="1.5"/>
+          </svg>
+          下载管理 · 进行中和排队
+        </span>
+        <span class="queue-panel-badge">{{ queueRunning.length + queueWaiting.length }} 个任务</span>
+      </div>
+      <div style="margin-top: 6px;">
+        <div v-for="item in queueRunning" :key="item.task_id" class="queue-row">
+          <div class="queue-row-main">
+            <div class="queue-row-top">
+              <span class="queue-status" :class="qsClass(item.status)">{{ qsText(item.status) }}</span>
+              <span class="queue-link" :title="item.link">{{ linkLabel(item) }}</span>
+              <button class="queue-redo" title="重新下载" :disabled="redoLoading" @click="redownload(item)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="15" height="15">
+                  <polyline points="23 4 23 10 17 10"/>
+                  <path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/>
+                </svg>
+              </button>
+            </div>
+            <div class="queue-progress-line">
+              <div class="queue-progress-fill" :style="{ width: rowProgress(item) + '%' }"></div>
+            </div>
+            <div class="queue-row-foot">
+              <span class="queue-files">{{ item.downloaded_files || 0 }}/{{ item.total_files || 0 }} 个文件</span>
+              <span class="queue-pct">{{ rowProgress(item) }}%</span>
+            </div>
+          </div>
+        </div>
+        <div v-for="(item, idx) in queueWaiting" :key="item.task_id" class="queue-row is-waiting">
+          <div class="queue-row-main">
+            <div class="queue-row-top">
+              <span class="queue-status q-status-queued">等待 {{ idx + 1 }}</span>
+              <span class="queue-link" :title="item.link">{{ linkLabel(item) }}</span>
+              <button class="queue-redo" title="重新下载" :disabled="redoLoading" @click="redownload(item)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="15" height="15">
+                  <polyline points="23 4 23 10 17 10"/>
+                  <path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/>
+                </svg>
+              </button>
+            </div>
+            <div class="queue-queued-hint">排队中，前面还有 {{ idx }} 个</div>
+          </div>
+        </div>
+      </div>
+    </div>
     
     <div class="filter-section">
       <div class="filter-item">
@@ -369,6 +506,13 @@ onUnmounted(() => {
                   </svg>
                   {{ formatFileSize(item.folder_size) }}
                 </span>
+                <span v-if="item.link" class="history-meta-item history-link-item" :title="item.link">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71"/>
+                    <path d="M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71"/>
+                  </svg>
+                  {{ linkLabel(item) }}
+                </span>
                 <span class="history-meta-item">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <circle cx="12" cy="12" r="10"/>
@@ -404,6 +548,18 @@ onUnmounted(() => {
               {{ zippingUsers.includes(item.user_id) ? t('history.zipping') : t('history.createZip') }}
             </button>
             <button 
+              class="action-btn action-redo"
+              :disabled="redoLoading"
+              @click="redownload(item)"
+              :title="item.link || '重新下载'"
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="23 4 23 10 17 10"/>
+                <path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/>
+              </svg>
+              重新下载
+            </button>
+            <button 
               class="action-btn action-delete"
               @click="deleteHistory(item.task_id)"
             >
@@ -429,4 +585,120 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+.queue-panel { padding: 16px 18px; }
+.queue-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 4px;
+}
+.queue-panel-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 15px;
+  font-weight: 700;
+  color: #1F2937;
+}
+.queue-panel-title svg { color: #4A6CF7; }
+.queue-panel-badge {
+  padding: 3px 10px;
+  border-radius: 20px;
+  background: #EFF4FF;
+  color: #4A6CF7;
+  font-size: 12px;
+  font-weight: 600;
+}
+.queue-row {
+  display: flex;
+  padding: 12px;
+  border-radius: 12px;
+  border: 1px solid #F0F1F3;
+  background: #FAFBFD;
+  margin-top: 8px;
+}
+.queue-row.is-waiting { background: #FBFAF4; }
+.queue-row-main { flex: 1; min-width: 0; }
+.queue-row-top { display: flex; align-items: center; gap: 10px; }
+.queue-status {
+  flex-shrink: 0;
+  padding: 2px 10px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.q-status-downloading { background: #DBEAFE; color: #2563EB; }
+.q-status-queued { background: #FEF3C7; color: #D97706; }
+.q-status-completed { background: #D1FAE5; color: #059669; }
+.q-status-failed { background: #FEE2E2; color: #DC2626; }
+.queue-link {
+  flex: 1;
+  min-width: 0;
+  font-size: 14px;
+  color: #1F2937;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.queue-redo {
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  border: none;
+  background: transparent;
+  color: #9CA3AF;
+  border-radius: 8px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+}
+.queue-redo:hover:not(:disabled) { background: #EFF4FF; color: #4A6CF7; }
+.queue-redo:disabled { opacity: 0.5; cursor: not-allowed; }
+.queue-progress-line {
+  margin-top: 10px;
+  height: 6px;
+  background: #EEF0F4;
+  border-radius: 3px;
+  overflow: hidden;
+}
+.queue-progress-fill {
+  height: 100%;
+  border-radius: 3px;
+  background: linear-gradient(90deg, #4A6CF7, #7B61FF);
+  transition: width 0.3s ease;
+}
+.queue-row-foot {
+  margin-top: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+  color: #9CA3AF;
+}
+.queue-queued-hint {
+  margin-top: 8px;
+  font-size: 12px;
+  color: #B6BEC9;
+}
+.history-link-item {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.action-redo {
+  color: #4A6CF7;
+}
+.action-redo:hover {
+  background: #EFF4FF;
+  border-color: #4A6CF7;
+}
+.action-redo:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
 </style>
