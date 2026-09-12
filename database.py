@@ -1,6 +1,7 @@
 import sqlite3
 import os
 import secrets
+import threading
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from contextlib import contextmanager
@@ -11,20 +12,27 @@ from config import Config
 
 DATABASE_PATH = os.path.join(Config.BASE_DIR, 'data.db')
 
+# 进程内串行化所有数据库访问，避免 threaded 多线程并发写同一 sqlite 文件
+# 导致 create_task/清空/进度更新等操作撞上 "database is locked" 而卡死请求
+_db_lock = threading.RLock()
+
 
 @contextmanager
 def get_db():
     """获取数据库连接的上下文管理器"""
-    conn = sqlite3.connect(DATABASE_PATH)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    with _db_lock:
+        conn = sqlite3.connect(DATABASE_PATH, timeout=20, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute('PRAGMA busy_timeout=20000')
+            conn.execute('PRAGMA journal_mode=WAL')
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
 
 def init_db():
@@ -202,7 +210,7 @@ def get_all_configs(user_id: int = None) -> List[Dict[str, Any]]:
     with get_db() as conn:
         cursor = conn.cursor()
         if user_id is not None:
-            cursor.execute('SELECT key, value, description, updated_at FROM config WHERE user_id = ? ORDER BY key', (user_id,))
+            cursor.execute("SELECT key, value, description, updated_at FROM config WHERE user_id = ? AND key != 'device_token' ORDER BY key", (user_id,))
             configs = [dict(row) for row in cursor.fetchall()]
             
             # 如果用户没有配置，自动创建默认配置
@@ -285,6 +293,35 @@ def update_config(key: str, value: str, user_id: int = None):
             ''', (value, key))
 
 
+def get_device_token() -> str:
+    """获取设备联动令牌（供安卓App等外部设备调用API），不存在则自动生成"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM config WHERE user_id = 1 AND key = 'device_token'")
+        row = cursor.fetchone()
+        if row and row['value']:
+            return row['value']
+        token = secrets.token_hex(16)
+        cursor.execute('''
+            INSERT INTO config (user_id, key, value, description, updated_at)
+            VALUES (1, 'device_token', ?, '设备联动令牌（安卓App推送链接用）', CURRENT_TIMESTAMP)
+        ''', (token,))
+        return token
+
+
+def rotate_device_token() -> str:
+    """重新生成设备联动令牌（旧令牌立即失效）"""
+    token = secrets.token_hex(16)
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO config (user_id, key, value, description, updated_at)
+            VALUES (1, 'device_token', ?, '设备联动令牌（安卓App推送链接用）', CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+        ''', (token,))
+        return token
+
+
 def add_download_history(task_id: str, user_id: str, user_name: str = None, account_user_id: int = None, link: str = None):
     """添加下载历史"""
     with get_db() as conn:
@@ -361,6 +398,16 @@ def get_download_history(limit: int = 50, offset: int = 0, keyword: str = '', st
         params.extend([limit, offset])
         
         cursor.execute(sql, params)
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def get_stale_downloads() -> List[Dict[str, Any]]:
+    """查询遗留的'排队中/下载中'任务，用于服务重启时清理僵尸记录"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM download_history WHERE status IN ('queued', 'downloading')"
+        )
         return [dict(row) for row in cursor.fetchall()]
 
 

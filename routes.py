@@ -8,6 +8,7 @@ import time
 import queue
 import httpx
 from datetime import datetime
+from functools import wraps
 from flask import Blueprint, render_template, request, jsonify, send_file, send_from_directory, g, Response, after_this_request
 
 from config import Config
@@ -191,11 +192,13 @@ def start_download_share():
     force = data.get('force', False)  # 是否强制重新下载
 
     if status_id:
+        print(f"[download-share] create_task enter: user={screen_name} single_tweet={status_id} force={force}", flush=True)
         task = download_service.create_task(
             screen_name, 'all', account_user_id,
             export_xlsx=export_xlsx, create_zip=create_zip,
             single_tweet=status_id, force=force, link=share_url
         )
+        print(f"[download-share] create_task done: task_id={task.task_id}", flush=True)
         return jsonify({
             'task_id': task.task_id,
             'user_id': screen_name,
@@ -583,7 +586,36 @@ def get_history():
         if user_id and user_id not in user_folder_sizes:
             user_folder_sizes[user_id] = get_folder_size(user_id, account_user_id)
         item['folder_size'] = user_folder_sizes.get(user_id, 0)
-    
+
+    # 补全缺失的昵称：任务中断（如服务重启清理）时未写入用户信息，
+    # 回填该用户最近一条有效昵称；头像统一由前端经 /api/avatar 拉取本地缓存，
+    # 这里不回填可能失效的 Twitter 外链，避免 img 加载失败导致头像全无。
+    need_backfill = [i for i in history if i.get('user_id') and not i.get('user_name')]
+    if need_backfill:
+        ref_cache = {}
+        for i in need_backfill:
+            uid = i['user_id']
+            if uid not in ref_cache:
+                ref_cache[uid] = database.get_download_history_by_user_id(uid)
+            for r in ref_cache[uid]:
+                if r.get('user_name'):
+                    i['user_name'] = r['user_name']
+                    break
+
+    # 头像统一指向本地缓存文件（若该用户本地有头像）：
+    # 空头像或在“外链”的，只要本地有缓存就填 /api/avatar-file/{uid}，
+    # 保证 img 可显示，且前后端返回稳定一致，避免列表不停刷新。
+    avatar_dir = os.path.join(Config.BASE_DIR, 'downloads', '.avatars')
+    _avatar_exts = ['.jpg', '.jpeg', '.png', '.webp']
+    for item in history:
+        uid = item.get('user_id')
+        if not uid:
+            continue
+        av = item.get('avatar_url')
+        if not av or (isinstance(av, str) and av.startswith('http')):
+            if any(os.path.exists(os.path.join(avatar_dir, f'{uid}{e}')) for e in _avatar_exts):
+                item['avatar_url'] = f'/api/avatar-file/{uid}'
+
     return jsonify({
         'data': history,
         'total': total,
@@ -614,6 +646,8 @@ def delete_history(task_id: str):
             if not other_records and os.path.exists(user_dir):
                 shutil.rmtree(user_dir)
         
+        # 同步从内存队列移除，避免删除后仍在队列面板显示“排队中”
+        download_service.remove_task(task_id)
         database.delete_download_history(task_id)
         return jsonify({'message': '已删除'})
     except Exception as e:
@@ -1139,3 +1173,82 @@ def clear_all_logs_api():
     """清除所有日志"""
     log_manager.clear_all_logs()
     return jsonify({'message': '日志已清除'})
+
+
+# ============ 设备联动接口（安卓App推送链接/查询进度） ============
+
+def device_token_required(f):
+    """设备令牌认证：供安卓App等外部设备调用，令牌在网页配置页获取"""
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        token = request.headers.get('X-Device-Token', '')
+        if not token:
+            data = request.get_json(silent=True) or {}
+            token = data.get('token', '') or ''
+        if not token:
+            token = request.args.get('token', '') or ''
+        expected = database.get_device_token()
+        if not expected or token != expected:
+            return jsonify({'error': '设备令牌无效，请在网页配置页获取令牌'}), 401
+        return f(*args, **kwargs)
+    return wrapper
+
+
+@main_bp.route('/api/device/token', methods=['GET'])
+@admin_required
+def get_device_token_api():
+    """获取当前设备联动令牌（首次调用自动生成）"""
+    return jsonify({'token': database.get_device_token()})
+
+
+@main_bp.route('/api/device/token', methods=['POST'])
+@admin_required
+def rotate_device_token_api():
+    """轮换设备联动令牌（旧令牌立即失效，手机App需重新填写）"""
+    return jsonify({'token': database.rotate_device_token()})
+
+
+@main_bp.route('/api/device/download', methods=['POST'])
+@device_token_required
+def device_download():
+    """设备端提交分享链接入队下载"""
+    data = request.get_json() or {}
+    share_url = (data.get('url') or '').strip()
+    if not share_url:
+        return jsonify({'error': '请输入分享链接'}), 400
+
+    share_re = re.search(r'(?:twitter\.com|x\.com)/([^/?]+)/status/(\d+)', share_url)
+    if share_re:
+        screen_name = share_re.group(1)
+        status_id = share_re.group(2)
+    else:
+        user_re = re.search(r'(?:twitter\.com|x\.com)/([^/?]+)', share_url)
+        if not user_re:
+            return jsonify({'error': '无法识别的链接，请提供 twitter.com 或 x.com 的分享链接'}), 400
+        screen_name = user_re.group(1)
+        status_id = None
+
+    force = data.get('force', False)
+    task = download_service.create_task(
+        screen_name, 'all', None,
+        export_xlsx=False, create_zip=True,
+        single_tweet=status_id, force=force, link=share_url
+    )
+    return jsonify({
+        'task_id': task.task_id,
+        'user_id': screen_name,
+        'queue_size': download_service.queue_size(),
+        'message': f'已加入下载队列（@{screen_name}）'
+    })
+
+
+@main_bp.route('/api/device/queue', methods=['GET'])
+@device_token_required
+def device_queue():
+    """设备端查询下载队列与进度：正在执行 + 等待中 + 近期历史"""
+    q = download_service.queue_list()
+    return jsonify({
+        'running': q.get('running', []),
+        'waiting': q.get('waiting', []),
+        'history': q.get('history', [])
+    })

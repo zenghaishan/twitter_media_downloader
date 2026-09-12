@@ -51,9 +51,10 @@ const fetchProgress = async () => {
     const data = await response.json()
     if (response.ok) {
       status.value = data.status
-      progress.value = data.progress
-      totalFiles.value = data.total_files
-      downloadedFiles.value = data.downloaded_files || 0
+      progress.value = Math.min(100, data.progress || 0)
+      const dl = data.downloaded_files || 0
+      downloadedFiles.value = dl
+      totalFiles.value = Math.max(dl, data.total_files || 0)
       const skippedFiles = data.skipped_files || 0
       errorMessage.value = data.error_message || ''
 
@@ -158,15 +159,21 @@ const startShareDownload = async () => {
   startTime = new Date()
 
   try {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 25000)
     const response = await fetch('/api/download-share', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: shareUrl.value.trim(), force: force.value })
+      body: JSON.stringify({ url: shareUrl.value.trim(), force: force.value }),
+      signal: controller.signal
     })
+    clearTimeout(timer)
     const data = await response.json()
     if (response.ok && data.task_id) {
       taskId.value = data.task_id
       queueCount.value = data.queue_size || 0
+      // 入队成功即复位按钮，可继续添加下一个链接；下载进度交由队列面板跟踪
+      isDownloading.value = false
       if (queueCount.value > 1) {
         ElMessage.success({
           message: `已加入下载队列，前面还有 ${queueCount.value - 1} 个任务`,
@@ -188,9 +195,29 @@ const startShareDownload = async () => {
       isDownloading.value = false
     }
   } catch (error) {
-    ElMessage.error(t('home.requestFailed') + (error as Error).message)
+    const errMsg = (error as Error)?.name === 'AbortError'
+      ? '请求超时，请确认服务正常后重试'
+      : (t('home.requestFailed') + (error as Error).message)
+    ElMessage.error(errMsg)
     isDownloading.value = false
   }
+}
+
+const normalDownload = () => {
+  selective.value = false
+  force.value = false
+  startShareDownload()
+}
+
+const forceDownload = () => {
+  selective.value = false
+  force.value = true
+  startShareDownload()
+}
+
+const selectivDownload = () => {
+  selective.value = true
+  fetchPreview()
 }
 
 const downloadZip = async () => {
@@ -422,38 +449,51 @@ onUnmounted(() => {
                 class="input-field" 
                 v-model="shareUrl" 
                 placeholder="例如: https://x.com/yykfPro/status/2097616305608393046?s=20"
-                @keyup.enter="selective ? fetchPreview() : startShareDownload()"
-                :disabled="selective && previewing"
+                @keyup.enter="normalDownload()"
+                :disabled="isDownloading || (selective && previewing)"
               >
             </div>
-            <button 
-              class="download-btn"
-              :class="{ loading: isDownloading || (selective && previewing) }"
-              :disabled="!shareUrl.trim() || (selective && previewing)"
-              @click="selective ? fetchPreview() : startShareDownload()"
-            >
-              <span v-if="isDownloading || (selective && previewing)" class="btn-spinner"></span>
-              <svg v-else width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                <path d="M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71"/>
-                <path d="M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71"/>
-              </svg>
-              {{ selective ? '抓取并选择' : '解析并下载' }}
-            </button>
+            <div class="download-actions">
+              <button 
+                class="download-btn"
+                :class="{ loading: isDownloading }"
+                :disabled="!shareUrl.trim() || isDownloading || (selective && previewing)"
+                @click="normalDownload"
+              >
+                <span v-if="isDownloading" class="btn-spinner"></span>
+                <svg v-else width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                  <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
+                  <polyline points="7 10 12 15 17 10"/>
+                  <line x1="12" y1="15" x2="12" y2="3"/>
+                </svg>
+                下载
+              </button>
+              <button 
+                class="sub-btn"
+                :disabled="!shareUrl.trim() || isDownloading || (selective && previewing)"
+                @click="forceDownload"
+                title="忽略已存在文件，覆盖同名文件"
+              >
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M21 12a9 9 0 11-2.64-6.36"/>
+                  <polyline points="21 3 21 9 15 9"/>
+                </svg>
+                重新下载
+              </button>
+              <button 
+                class="sub-btn"
+                :disabled="!shareUrl.trim()"
+                @click="selectivDownload"
+                title="抓取推文下的文件，按需勾选下载"
+              >
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <circle cx="11" cy="11" r="7"/>
+                  <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                </svg>
+                选择下载
+              </button>
+            </div>
           </div>
-        </div>
-      </div>
-    </div>
-    
-    <!-- 下载选项 -->
-    <div class="input-section">
-      <div class="input-wrapper">
-        <div style="display:flex;align-items:center;gap:10px;padding:4px 2px;">
-          <el-switch v-model="force" size="small" active-text="强制" />
-          <span style="font-size:14px;color:#333;">强制重新下载（忽略已存在文件，覆盖同名文件）</span>
-        </div>
-        <div style="display:flex;align-items:center;gap:10px;padding:4px 2px;">
-          <el-switch v-model="selective" size="small" active-text="选择性" />
-          <span style="font-size:14px;color:#333;">选择性下载（抓取推文下的文件，按需勾选下载）</span>
         </div>
       </div>
     </div>
@@ -510,7 +550,7 @@ onUnmounted(() => {
         </template>
 
         <div v-else style="font-size:13px;color:#aaa;padding:10px 2px;">
-          在上方「分享链接下载」输入链接，点击「抓取并选择」即可预览推文下的全部文件并勾选下载
+          在上方「分享链接下载」输入链接，点击「选择下载」即可预览推文下的全部文件并勾选下载
         </div>
       </div>
     </div>
@@ -622,6 +662,64 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+.hint-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  background: #e5e7eb;
+  color: #6b7280;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: help;
+  user-select: none;
+}
+.hint-icon:hover {
+  background: #d1d5db;
+}
+.download-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.download-actions .download-btn {
+  width: auto;
+  padding: 0 26px;
+}
+.sub-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 48px;
+  padding: 0 18px;
+  border: 1.5px solid rgba(229, 231, 235, 0.8);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.9);
+  color: #4b5563;
+  font-size: 14px;
+  font-weight: 500;
+  font-family: inherit;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.sub-btn svg {
+  flex-shrink: 0;
+}
+.sub-btn:hover:not(:disabled) {
+  border-color: #4a6cf7;
+  color: #4a6cf7;
+  background: rgba(74, 108, 247, 0.05);
+}
+.sub-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
 .selective-panel {
   width: 100%;
 }

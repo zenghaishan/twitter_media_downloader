@@ -21,7 +21,9 @@ class DownloadService:
     
     def __init__(self):
         self._tasks: Dict[str, DownloadTask] = {}
-        self._lock = threading.Lock()
+        # 必须用 RLock：_enqueue 在持锁状态下调用 _link_boost，后者再次获取 self._lock。
+        # 若用 threading.Lock（不可重入），同一线程第二次获取会永久死锁，导致所有入队请求转圈。
+        self._lock = threading.RLock()
         # 每个用户的串行锁，避免同一用户多个任务并发写同一目录导致 Windows WinError5
         self._user_locks: Dict[str, threading.Lock] = {}
         self._user_locks_guard = threading.Lock()
@@ -30,6 +32,7 @@ class DownloadService:
         self._dl_queue = queue.Queue()
         self._task_order: list = []  # 入队顺序（排队等待的任务），供队列展示
         self._worker_started = False
+        self._worker_thread = None
         self._worker_guard = threading.Lock()
         
         # 确保下载目录存在
@@ -40,7 +43,14 @@ class DownloadService:
         
         # 初始化数据库
         database.init_db()
-    
+
+        # 清理服务重启/异常退出后遗留的“排队中/下载中”僵尸任务，避免历史页出现永不结束的等待
+        self._recover_stale_tasks()
+
+        # 主动常驻启动队列消费线程：不依赖首次入队时才拉起，
+        # 避免 worker 中途退出后入队任务因无人消费而永远停留在 queued。
+        self._ensure_worker()
+
     def get_task(self, task_id: str) -> Optional[DownloadTask]:
         """获取任务（优先内存，其次数据库）"""
         # 先从内存获取
@@ -63,12 +73,35 @@ class DownloadService:
         
         return None
     
+    def _recover_stale_tasks(self):
+        """服务启动时把数据库中遗留的 queued/downloading 任务标记为 failed。
+        这些任务可能因服务重启、debug reload、线程异常而未真正执行，若不清理
+        会在历史页面永久显示为“排队中”。"""
+        try:
+            for row in database.get_stale_downloads():
+                database.update_download_history(
+                    row['task_id'],
+                    status='failed',
+                    error_message='服务重启导致任务中断，可点击“重新下载”恢复',
+                    completed_at=time.strftime('%Y-%m-%d %H:%M:%S')
+                )
+        except Exception:
+            import traceback
+            traceback.print_exc()
+
     def create_task(self, user_id: str, download_type: str = 'all', account_user_id: int = None, export_xlsx: bool = False, create_zip: bool = True, single_tweet: str = None, force: bool = False, link: str = None) -> DownloadTask:
         """创建下载任务
         single_tweet: 若提供推文ID，则只下载该推文的媒体
         force: 若为True，忽略"已存在"去重，强制重新下载
         link: 原始提交链接（用于队列展示与重复提交排序提升）
         """
+        # 重复链接去重：若该链接已有任务（等待中/下载中/历史记录），直接复用旧任务并提到队首，
+        # 按最后一次添加时间排序，不新建重复记录。
+        if link and not force:
+            dup_task, reused = self._promote_existing_link(link)
+            if reused:
+                return dup_task
+
         # 检查是否已有该用户的下载记录（单推文分享任务不复用历史）
         existing_record = None if single_tweet else database.get_latest_download_by_user_id(user_id)
         
@@ -111,6 +144,53 @@ class DownloadService:
         self._enqueue(task_id, link, single_tweet, force, None)
         
         return task
+
+    def _promote_existing_link(self, link: str):
+        """重复链接去重：命中时把已有任务提到队首并重新排队，不新建记录。
+        优先级：等待中 > 下载中 > 历史记录（复用历史 task_id 强制重下）。
+        返回 (task, True) 表示已复用（调用方直接返回该任务）；(None, False) 表示无重复。"""
+        def _parse_tweet(link):
+            m = re.search(r'(?:twitter\.com|x\.com)/[^/?]+/status/(\d+)', link)
+            return m.group(1) if m else None
+
+        # 1) 等待中的任务：直接提到队首，实现“按最后提交时间排序”
+        with self._lock:
+            for tid in list(self._task_order):
+                t = self.get_task(tid)
+                if t and t.status == 'queued' and getattr(t, 'link', '') == link:
+                    self._task_order.remove(tid)
+                    self._task_order.insert(0, tid)
+                    return t, True
+            # 2) 正在下载的任务：无法重排，提示已复用正在下载的任务
+            for tid, t in list(self._tasks.items()):
+                if t.status == 'downloading' and getattr(t, 'link', '') == link:
+                    return t, True
+            # 3) 历史记录：复用该 task_id 重新入队（强制重新下载）
+            hist = database.get_last_download_by_link(link)
+            if hist and hist.get('status') != 'downloading':
+                tid = hist['task_id']
+                t = DownloadTask(
+                    tid, hist['user_id'],
+                    account_user_id=hist.get('account_user_id'),
+                    create_zip=True
+                )
+                t.link = hist.get('link') or link
+                t.status = 'queued'
+                database.update_download_history(
+                    tid,
+                    status='queued',
+                    downloaded_files=0,
+                    total_files=0,
+                    error_message=None,
+                    completed_at=None,
+                    created_at=time.strftime('%Y-%m-%d %H:%M:%S')
+                )
+                self._tasks[tid] = t
+                self._task_order.insert(0, tid)
+                self._dl_queue.put((tid, _parse_tweet(link), True, None))  # force 重下
+                self._ensure_worker()
+                return t, True
+        return None, False
 
     def create_selected_task(self, user_id: str, items: list, account_user_id: int = None, force: bool = False, link: str = None) -> DownloadTask:
         """创建“选择性下载”任务：仅下载用户勾选的媒体项。
@@ -193,13 +273,17 @@ class DownloadService:
             loop.close()
     
     def _ensure_worker(self):
-        """确保唯一的队列消费工作线程已启动"""
+        """确保唯一的队列消费工作线程存活。若已存在且仍在运行则复用，否则重启，
+        避免 debug/reload 或线程异常退出后，入队任务因无人消费而永远停留在 queued。"""
         with self._worker_guard:
-            if self._worker_started:
+            w = self._worker_thread
+            if w is not None and w.is_alive():
+                self._worker_started = True
                 return
+            # worker 已不存在或已死亡，重建线程
+            self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
             self._worker_started = True
-            worker = threading.Thread(target=self._worker_loop, daemon=True)
-            worker.start()
+            self._worker_thread.start()
 
     def _worker_loop(self):
         """串行消费全局下载队列"""
@@ -273,19 +357,40 @@ class DownloadService:
         return {'running': running, 'waiting': waiting, 'history': history}
 
     def re_download_task(self, task: DownloadTask, account_user_id: int = None) -> DownloadTask:
-        """重新下载一个历史任务：按存储的链接/用户重新入队（强制重新下载）"""
+        """重新下载一个历史任务：复用原记录（不新增），按原链接强制重新入队"""
+        task_id = task.task_id
         link = getattr(task, 'link', '') or ''
-        user_id = task.user_id
+        single_tweet = None
         if link:
-            # 分享链接：按链接重新入队
             m = re.search(r'(?:twitter\.com|x\.com)/([^/?]+)/status/(\d+)', link)
-            status_id = m.group(2) if m else None
-            return self.create_task(
-                user_id, 'all', account_user_id, export_xlsx=False, create_zip=True,
-                single_tweet=status_id, force=True, link=link
-            )
-        # 用户下载：全量重新下载
-        return self.create_task(user_id, 'all', account_user_id, export_xlsx=False, create_zip=True, force=True, link='')
+            single_tweet = m.group(2) if m else None
+        # 直接复用当前 task_id，重置为该链接的下载任务并重新入队，绝不新增记录
+        database.update_download_history(
+            task_id,
+            status='queued',
+            downloaded_files=0,
+            total_files=0,
+            error_message=None,
+            completed_at=None,
+            created_at=time.strftime('%Y-%m-%d %H:%M:%S')
+        )
+        task.status = 'queued'
+        task.downloaded_files = 0
+        task.total_files = 0
+        task.error_message = None
+        task.link = link
+        with self._lock:
+            self._tasks[task_id] = task
+        log_manager.info(task_id, task.user_id, f'重新下载已重新入队: {task.user_id}', 'system')
+        self._enqueue(task_id, link, single_tweet, force=True, selected_items=None)
+        return task
+
+    def remove_task(self, task_id: str):
+        """从内存中移除任务（删除历史记录时调用），避免删除后仍残留在队列面板中"""
+        with self._lock:
+            self._tasks.pop(task_id, None)
+            if task_id in self._task_order:
+                self._task_order.remove(task_id)
 
     def _run_download(self, task_id: str, single_tweet: str = None, force: bool = False, selected_items: list = None):
         """运行下载任务（在后台线程中执行）"""
@@ -518,7 +623,12 @@ class DownloadService:
         
         # 清空下载历史
         database.clear_all_download_history()
-        
+
+        # 同步清空内存任务/队列，避免清空后残留任务继续显示“排队中”或被误复用
+        with self._lock:
+            self._tasks.clear()
+            self._task_order.clear()
+
         return {'deleted_files': deleted_files, 'deleted_dirs': deleted_dirs}
     
     def _create_zip(self, task: DownloadTask):

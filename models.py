@@ -11,7 +11,7 @@ class DownloadTask:
         self.export_xlsx = export_xlsx  # 是否导出xlsx
         self.create_zip = create_zip  # 是否生成压缩包
         self.tweets_info = []  # 帖子信息列表，用于生成xlsx
-        self.status = 'pending'  # pending, downloading, completed, failed
+        self.status = 'queued'  # queued, downloading, completed, failed（与服务端入队状态一致）
         self.progress = 0
         self.total_files = 0
         self.downloaded_files = 0

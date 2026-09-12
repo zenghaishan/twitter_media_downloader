@@ -60,9 +60,11 @@ const linkLabel = (item: any) => {
   }
   return item.user_id ? '@' + item.user_id : ''
 }
+const displayTotal = (item: any) => Math.max(item.downloaded_files || 0, item.total_files || 0)
 const rowProgress = (item: any) => {
   if ((item.status === 'downloading' || item.status === 'queued') && item.total_files) {
-    return Math.round((item.downloaded_files / item.total_files) * 100)
+    const denom = displayTotal(item) || 1
+    return Math.min(100, Math.round((item.downloaded_files / denom) * 100))
   }
   return item.status === 'completed' ? 100 : 0
 }
@@ -161,7 +163,8 @@ const fetchHistory = async (page = 1, showLoading = true) => {
 const fetchMissingAvatars = async (items: any[]) => {
   const missingUsers = new Set<string>()
   for (const item of items) {
-    if (!item.avatar_url && item.user_id) {
+    // 没有头像，或头像为 Twitter 外链（浏览器无法直接访问，用本地化头像兜底）都纳入拉取
+    if (item.user_id && (!item.avatar_url || String(item.avatar_url).startsWith('http'))) {
       missingUsers.add(item.user_id)
     }
   }
@@ -375,7 +378,7 @@ onUnmounted(() => {
               <div class="queue-progress-fill" :style="{ width: rowProgress(item) + '%' }"></div>
             </div>
             <div class="queue-row-foot">
-              <span class="queue-files">{{ item.downloaded_files || 0 }}/{{ item.total_files || 0 }} 个文件</span>
+              <span class="queue-files">{{ item.downloaded_files || 0 }}/{{ displayTotal(item) }} 个文件</span>
               <span class="queue-pct">{{ rowProgress(item) }}%</span>
             </div>
           </div>
@@ -421,7 +424,7 @@ onUnmounted(() => {
           <option value="downloading">{{ t('history.downloading') }}</option>
           <option value="completed">{{ t('history.completed') }}</option>
           <option value="failed">{{ t('history.failed') }}</option>
-          <option value="pending">{{ t('history.pending') }}</option>
+          <option value="queued">{{ t('history.pending') }}</option>
         </select>
       </div>
       <div class="filter-item">
@@ -496,7 +499,7 @@ onUnmounted(() => {
                     <path d="M13 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V9z"/>
                     <polyline points="13 2 13 9 20 9"/>
                   </svg>
-                  {{ item.downloaded_files || 0 }}/{{ item.total_files || 0 }} {{ t('history.files') }}
+                  {{ item.downloaded_files || 0 }}/{{ displayTotal(item) }} {{ t('history.files') }}
                 </span>
                 <span v-if="item.folder_size" class="history-meta-item">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">

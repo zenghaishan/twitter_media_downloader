@@ -123,6 +123,11 @@ const fetchAvatar = async () => {
   }
 }
 
+const onAvatarError = () => {
+  // img 加载失败时清空 URL，让 v-else 的首字母 fallback 渲染，避免白屏
+  profile.avatar_url = ''
+}
+
 const changePassword = async () => {
   if (!passwordForm.oldPassword || !passwordForm.newPassword || !passwordForm.confirmPassword) {
     ElMessage.warning(t('profile.fillAllPasswordFields'))
@@ -187,7 +192,7 @@ onMounted(() => {
       <div class="avatar-section">
         <div class="avatar-wrapper">
           <img v-if="profile.avatar_url" :src="profile.avatar_url" :alt="profile.nickname"
-               @error="$event.target.style.display='none'; $event.target.nextElementSibling.style.display='flex'" />
+               @error="onAvatarError" />
           <span v-else class="avatar-fallback">{{ (profile.nickname || profile.username || '?').charAt(0).toUpperCase() }}</span>
         </div>
         <div class="avatar-info">

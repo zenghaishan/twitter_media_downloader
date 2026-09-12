@@ -21,11 +21,14 @@ def main():
     os.makedirs(Config.DOWNLOAD_FOLDER, exist_ok=True)
     
     # 启动Flask应用
+    # use_reloader=False：关闭 debug 热重载，避免重载时丢失下载 worker 线程与内存队列，
+    # 导致任务永远停留在 queued。改代码后需手动重启服务。
     app.run(
         debug=Config.DEBUG,
         host=Config.HOST,
         port=Config.PORT,
-        threaded=True
+        threaded=True,
+        use_reloader=False
     )
 
 

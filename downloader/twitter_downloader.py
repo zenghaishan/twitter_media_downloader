@@ -222,7 +222,8 @@ class TwitterDownloader:
     def get_heighest_video_quality(self, variants) -> str:
         if len(variants) == 1:
             return variants[0]['url']
-        
+
+        # 首选：带 bitrate 的 mp4 中选码率最高（m3u8 无 bitrate 字段会被自动跳过）
         max_bitrate = 0
         heighest_url = None
         for i in variants:
@@ -230,7 +231,36 @@ class TwitterDownloader:
                 if int(i['bitrate']) > max_bitrate:
                     max_bitrate = int(i['bitrate'])
                     heighest_url = i['url']
-        return heighest_url
+        if heighest_url:
+            return heighest_url
+
+        # 兜底1：全部无 bitrate（如只有 m3u8 流）时，从 URL 路径解析 vid/{w}x{h}/ 选分辨率最高的 mp4
+        def _res_height(url: str) -> int:
+            m = re.search(r'/vid/(\d+)x(\d+)/', url)
+            return int(m.group(2)) if m else 0
+
+        max_h = 0
+        fallback_url = None
+        m3u8_url = None
+        for i in variants:
+            url = i.get('url', '')
+            if not url:
+                continue
+            if i.get('content_type') == 'application/x-mpegURL':
+                if not m3u8_url:
+                    m3u8_url = url
+                continue
+            h = _res_height(url)
+            if h > max_h:
+                max_h = h
+                fallback_url = url
+        if fallback_url:
+            return fallback_url
+
+        # 兜底2：连分辨率都解析不到时退回 m3u8，最后退回第一个
+        if m3u8_url:
+            return m3u8_url
+        return variants[0]['url'] if variants else None
     
     def get_url_from_content(self, content):
         photo_lst = []
