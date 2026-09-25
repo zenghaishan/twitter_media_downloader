@@ -20,8 +20,11 @@ class TwitterDownloader:
                  user_info_callback: Optional[Callable] = None,
                  skip_existing: bool = True,
                  max_retries: int = 50,
-                 use_name_scoped_dir: bool = False):
+                 use_name_scoped_dir: bool = False,
+                 tweet_id_hint: str = None):
         self.user_id = user_id
+        # 提供推文ID时，可从该推文反查作者，用于 x.com/i/status/{id} 这类无用户名的链接
+        self.tweet_id_hint = tweet_id_hint or None
         self.download_path = download_path
         self.proxy = proxy
         self.cookie = cookie
@@ -224,7 +227,105 @@ class TwitterDownloader:
                       'system')
             await asyncio.sleep(delay)
 
+    async def resolve_author_by_tweet(self, tweet_id: str) -> bool:
+        """按推文ID反查作者，用于 x.com/i/status/{id} 这类无用户名的链接。
+
+        先用页面 302 重定向拿到真实 screen_name；若链接不再重定向出用户名，
+        再用 TweetResultByRestId GraphQL 从推文中读取作者。成功则回填 user_info 并返回 True。
+        """
+        tweet_id = (tweet_id or '').strip()
+        if not tweet_id:
+            return False
+
+        screen_name = None
+        # 方式1：请求单推文页面，读取 302 重定向到 /{user}/status/{id}
+        try:
+            async with self._get_client() as client:
+                resp = await client.get(
+                    f'https://x.com/i/status/{tweet_id}',
+                    headers=self.headers, timeout=20,
+                    follow_redirects=False
+                )
+                loc = (resp.headers.get('location') or resp.headers.get('Location') or '')
+                m = re.search(r'(?:twitter\.com|x\.com)/([A-Za-z0-9_]{1,15})/status/', loc)
+                if m and m.group(1).lower() != 'i':
+                    screen_name = m.group(1)
+        except Exception:
+            screen_name = None
+
+        rest_id = None
+        # 方式2：TweetResultByRestId 从推文里读作者（screen_name 通常带不上，只拿 rest_id，
+        # 若没有 screen_name 则用 UserByScreenName 用不到，只能靠 UserTweets 走 rest_id）
+        if screen_name or rest_id:
+            pass
+        else:
+            features = ("responsive_web_graphql_exclude_directive_enabled:true,"
+                        "verified_phone_label_enabled:false,creator_subscriptions_tweet_preview_api_enabled:true,"
+                        "responsive_web_graphql_timeline_navigation_enabled:true,"
+                        "responsive_web_graphql_skip_user_profile_image_extensions_enabled:false,"
+                        "tweetypie_unmention_optimization_enabled:true,responsive_web_edit_tweet_api_enabled:true,"
+                        "graphql_is_translatable_rweb_tweet_is_translatable_enabled:true,"
+                        "view_counts_everywhere_api_enabled:true,longform_notetweets_consumption_enabled:true,"
+                        "responsive_web_twitter_article_tweet_consumption_enabled:false,"
+                        "tweet_awards_web_tipping_enabled:false,freedom_of_speech_not_reach_fetch_enabled:true,"
+                        "standardized_nudges_misinfo:true,tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled:true,"
+                        "rweb_video_timestamps_enabled:true,longform_notetweets_rich_text_read_enabled:true,"
+                        "longform_notetweets_inline_media_enabled:true,responsive_web_media_download_video_enabled:false,"
+                        "responsive_web_enhance_cards_enabled:false")
+            variables = ('{"tweetId":"%s","withCommunity":false,"withQuickPromoteEligibilityTweetFields":true,'
+                         '"withVoice":true}' % tweet_id)
+            url = ('https://twitter.com/i/api/graphql/FW5CVuWkU4AKZURmkkLE4g/TweetResultByRestId'
+                   '?variables=' + variables + '&features={' + features + '}')
+            try:
+                async with self._get_client() as client:
+                    resp = await self._api_get(client, self.quote_url(url))
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        res = ((data.get('data') or {}).get('tweetResult') or {}).get('result') or {}
+                        if isinstance(res, dict) and 'tweet' in res:
+                            res = res['tweet']
+                        legacy = res.get('legacy') or {}
+                        rest_id = legacy.get('id_str') or res.get('rest_id')
+                        core = res.get('core') or {}
+                        user = ((core.get('user_results') or {}).get('result') or {})
+                        user_legacy = user.get('legacy') or {}
+                        if not screen_name:
+                            screen_name = user_legacy.get('screen_name')
+                        if not rest_id:
+                            rest_id = user.get('rest_id') or user.get('id_str')
+                        if not self.user_info.get('name'):
+                            self.user_info['name'] = user_legacy.get('name')
+                        if not self.user_info.get('avatar_url'):
+                            a = user_legacy.get('profile_image_url_https')
+                            if a:
+                                self.user_info['avatar_url'] = a.replace('_normal', '_400x400')
+            except Exception:
+                rest_id = None
+
+        if not (screen_name or rest_id):
+            self._log('error', f'根据推文ID {tweet_id} 反查作者失败：未拿到有效作者信息', 'system')
+            return False
+
+        # 用反查到的作者信息回填 user_info；若只有 rest_id，则后续按 UserTweets(rest_id) 拉取
+        if screen_name:
+            self.user_info['screen_name'] = screen_name
+            self.headers['referer'] = f'https://twitter.com/{screen_name}'
+        if rest_id:
+            self.user_info['rest_id'] = rest_id
+        self._log('info', f'由推文ID反查到作者: @{screen_name} (rest_id={rest_id})', 'system')
+        return True
+
     async def get_other_info(self):
+        # 无用户名链接（如 x.com/i/status/{id}）：screen_name 无效时先用推文ID反查作者
+        if self.tweet_id_hint and (not self.user_info.get('screen_name') or str(self.user_info.get('screen_name')).lower() == 'i'):
+            if await self.resolve_author_by_tweet(self.tweet_id_hint):
+                # 反查成功但只拿到 rest_id、没有真实 screen_name 时，无法走 UserByScreenName；
+                # 直接标记用户信息到位（rest_id 足够拉取其时间线），短路返回。
+                if not self.user_info.get('screen_name') and self.user_info.get('rest_id'):
+                    self._log('info', f'已获得作者 rest_id={self.user_info.get("rest_id")}，无需用户名即可拉取', 'system')
+                    self.user_info['media_count'] = self.user_info.get('media_count') or 100
+                    return True
+                # 反查拿到真实 screen_name，fall through 走下面的 UserByScreenName 正常流程
         url = f'https://twitter.com/i/api/graphql/xc8f1g7BYqr6VTzTbvNlGw/UserByScreenName?variables={{"screen_name":"{self.user_info["screen_name"]}","withSafetyModeUserFields":false}}&features={{"hidden_profile_likes_enabled":false,"hidden_profile_subscriptions_enabled":false,"responsive_web_graphql_exclude_directive_enabled":true,"verified_phone_label_enabled":false,"subscriptions_verification_info_verified_since_enabled":true,"highlights_tweets_tab_ui_enabled":true,"creator_subscriptions_tweet_preview_api_enabled":true,"responsive_web_graphql_skip_user_profile_image_extensions_enabled":false,"responsive_web_graphql_timeline_navigation_enabled":true}}&fieldToggles={{"withAuxiliaryUserLabels":false}}'
         
         try:

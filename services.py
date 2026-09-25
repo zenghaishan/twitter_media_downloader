@@ -260,7 +260,8 @@ class DownloadService:
             proxy=proxy,
             cookie=cookie,
             skip_existing=True,
-            use_name_scoped_dir=True
+            use_name_scoped_dir=True,
+            tweet_id_hint=single_tweet
         )
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -489,7 +490,8 @@ class DownloadService:
                 user_info_callback=user_info_callback,
                 skip_existing=not force,  # 强制重新下载时忽略已存在文件
                 max_retries=50,
-                use_name_scoped_dir=True
+                use_name_scoped_dir=True,
+                tweet_id_hint=single_tweet
             )
             
             # 将实时日志管理器传递给下载器
