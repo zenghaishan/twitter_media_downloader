@@ -1,74 +1,48 @@
 @echo off
-chcp 65001 >nul
+setlocal EnableExtensions
+cd /d "%~dp0"
 
-echo ==========================================
-echo 推特媒体下载器 - 启动脚本
-echo ==========================================
+echo ==============================================
+echo    Twitter Media Downloader  -  Quick Start
+echo ==============================================
+echo.
 
-REM 检查Python版本
-python --version >nul 2>&1
-if %errorlevel% neq 0 (
-    echo 错误: 未找到Python，请先安装Python3
-    pause
-    exit /b 1
+REM ---- 1. release port if occupied by a stale process ----
+set PORT=12345
+for /f "tokens=5" %%a in ('netstat -ano -p tcp ^| findstr "LISTENING" ^| findstr ":%PORT% "') do (
+  if not "%%a"=="0" (
+    echo [info] port %PORT% held by PID %%a, stopping it...
+    taskkill /F /PID %%a >nul 2>&1
+  )
 )
 
-REM 检查Python依赖
-echo 检查Python依赖...
-python -c "import flask" >nul 2>&1
-if %errorlevel% neq 0 (
-    echo 安装Flask...
-    pip install flask
+REM ---- 2. locate python (PATH first, then known fallback path) ----
+set "PY=python"
+where python >nul 2>&1
+if errorlevel 1 (
+  if exist "%~dp0\.python_path.txt" (
+    set /p PY=<"%~dp0\.python_path.txt"
+  ) else (
+    REM fallback: TRAE builtin python used on this machine
+    if exist "C:\Users\Administrator\AppData\Roaming\TRAE SOLO CN\ModularData\ai-agent\vm\tools\python\python.exe" (
+      set "PY=C:\Users\Administrator\AppData\Roaming\TRAE SOLO CN\ModularData\ai-agent\vm\tools\python\python.exe"
+    )
+  )
 )
 
-python -c "import httpx" >nul 2>&1
-if %errorlevel% neq 0 (
-    echo 安装httpx...
-    pip install httpx
+"%PY%" --version >nul 2>&1
+if errorlevel 1 (
+  echo [error] python not found. Please set python path in .python_path.txt
+  pause
+  exit /b 1
 )
 
-REM 检查Node.js和npm
-node --version >nul 2>&1
-if %errorlevel% neq 0 (
-    echo 错误: 未找到Node.js，请先安装Node.js
-    pause
-    exit /b 1
-)
-npm --version >nul 2>&1
-if %errorlevel% neq 0 (
-    echo 错误: 未找到npm，请先安装npm
-    pause
-    exit /b 1
-)
+REM ---- 3. launch the service (keep console window to watch logs) ----
+echo [start] launching service on http://127.0.0.1:%PORT% ...
+echo [stop ] press Ctrl+C or close this window to stop the service.
+echo.
+"%PY%" run.py
 
-REM 检查Vue3项目依赖
-echo 检查Vue3项目依赖...
-if not exist vue\node_modules (
-    echo 安装Vue3项目依赖...
-    cd vue
-    npm install
-    cd ..
-)
-
-REM 创建下载目录
-if not exist downloads mkdir downloads
-
-echo ==========================================
-echo 启动推特媒体下载器...
-echo 后端地址: http://localhost:12345
-echo 前端地址: http://localhost:5173
-echo 按 Ctrl+C 停止服务器
-echo ==========================================
-
-REM 启动Vue3开发服务器（后台）
-echo 启动Vue3前端开发服务器...
-cd vue
-start "" /B npm run dev
-cd ..
-REM 等待Vue3服务器启动
-timeout /t 2 /nobreak >nul
-
-REM 启动Flask应用
-echo 启动推特媒体下载器后端...
-python run.py
+echo.
+echo [error] service exited with code %errorlevel%
 pause

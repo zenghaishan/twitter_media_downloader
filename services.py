@@ -14,6 +14,7 @@ from downloader.twitter_downloader import TwitterDownloader
 from logger import DownloadLogger
 from realtime_logger import log_manager
 import database
+import webdav_sync
 
 
 class DownloadService:
@@ -561,6 +562,7 @@ class DownloadService:
             )
             
             log_manager.success(task_id, task.user_id, '任务已完成!', 'system')
+            webdav_sync.push_async()
             
         except Exception as e:
             import traceback

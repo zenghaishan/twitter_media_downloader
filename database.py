@@ -183,6 +183,12 @@ def init_db():
             ('auth_token', '', 'auth_token'),
             ('ct0', '', 'ct0'),
             ('download_dir', '', '下载根目录（留空使用默认下载目录）'),
+            ('webdav_url', '', 'WebDAV 服务器地址'),
+            ('webdav_username', '', 'WebDAV 用户名'),
+            ('webdav_password', '', 'WebDAV 密码（仅本机，上传时整体加密）'),
+            ('webdav_encrypt_pass', '', 'WebDAV 加密口令（云端密文解密密钥，不同步上传）'),
+            ('webdav_enabled', '0', '是否启用 WebDAV 同步（0/1）'),
+            ('webdav_dir', 'twitter_downloader', 'WebDAV 同步根目录名'),
         ]
         
         for key, value, description in default_configs:
@@ -598,6 +604,12 @@ def create_user(username: str, password: str, nickname: str = None,
             ('auth_token', '', 'auth_token'),
             ('ct0', '', 'ct0'),
             ('download_dir', '', '下载根目录（留空使用默认下载目录）'),
+            ('webdav_url', '', 'WebDAV 服务器地址'),
+            ('webdav_username', '', 'WebDAV 用户名'),
+            ('webdav_password', '', 'WebDAV 密码（仅本机，上传时整体加密）'),
+            ('webdav_encrypt_pass', '', 'WebDAV 加密口令（云端密文解密密钥，不同步上传）'),
+            ('webdav_enabled', '0', '是否启用 WebDAV 同步（0/1）'),
+            ('webdav_dir', 'twitter_downloader', 'WebDAV 同步根目录名'),
         ]
         
         for key, value, description in default_configs:
@@ -762,3 +774,37 @@ def delete_invite_code(code_id: int):
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute('DELETE FROM invite_codes WHERE id = ?', (code_id,))
+
+
+def export_all_history() -> List[Dict[str, Any]]:
+    """导出全部下载历史记录（供 WebDAV 同步）"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM download_history ORDER BY id')
+        rows = cursor.fetchall()
+        cols = [d[0] for d in cursor.description]
+        return [dict(zip(cols, row)) for row in rows]
+
+
+def count_history_all() -> int:
+    """统计全部下载历史记录条数"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT COUNT(*) AS n FROM download_history')
+        return cursor.fetchone()['n']
+
+
+def restore_history(rows: List[Dict[str, Any]]):
+    """从 WebDAV 还原历史记录（按主键覆盖写入）"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        for r in rows:
+            keys = list(r.keys())
+            if not keys:
+                continue
+            cols = ','.join(keys)
+            marks = ','.join('?' * len(keys))
+            cursor.execute(
+                f'INSERT OR REPLACE INTO download_history ({cols}) VALUES ({marks})',
+                [r[k] for k in keys]
+            )

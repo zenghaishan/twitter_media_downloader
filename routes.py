@@ -16,6 +16,7 @@ from services import download_service
 from realtime_logger import log_manager
 import database
 from auth import login_required, get_current_user, admin_required
+import webdav_sync
 
 # 媒体文件扩展名
 MEDIA_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.mp4', '.webm', '.webp'}
@@ -76,41 +77,41 @@ main_bp = Blueprint('main', __name__)
 @login_required
 def index():
     """首页"""
-    return send_file('vue/dist/index.html')
+    return send_file(os.path.join(Config.RESOURCE_DIR, 'vue/dist/index.html'))
 
 
 @main_bp.route('/config')
 @login_required
 def config_page():
     """配置管理页面"""
-    return send_file('vue/dist/index.html')
+    return send_file(os.path.join(Config.RESOURCE_DIR, 'vue/dist/index.html'))
 
 
 @main_bp.route('/history')
 @login_required
 def history_page():
     """下载历史页面"""
-    return send_file('vue/dist/index.html')
+    return send_file(os.path.join(Config.RESOURCE_DIR, 'vue/dist/index.html'))
 
 
 @main_bp.route('/detail/<user_id>')
 @login_required
 def detail_page(user_id: str):
     """用户媒体详情页面"""
-    return send_file('vue/dist/index.html')
+    return send_file(os.path.join(Config.RESOURCE_DIR, 'vue/dist/index.html'))
 
 
 @main_bp.route('/gallery')
 @login_required
 def gallery_page():
     """用户画廊页面"""
-    return send_file('vue/dist/index.html')
+    return send_file(os.path.join(Config.RESOURCE_DIR, 'vue/dist/index.html'))
 
 
 @main_bp.route('/assets/<path:filename>')
 def serve_vue_assets(filename):
     """服务Vue应用的静态资源"""
-    return send_from_directory('vue/dist/assets', filename)
+    return send_from_directory(os.path.join(Config.RESOURCE_DIR, 'vue/dist/assets'), filename)
 
 
 @main_bp.route('/api/download', methods=['POST'])
@@ -534,9 +535,46 @@ def update_configs():
     try:
         for key, value in data.items():
             database.update_config(key, value, user_id=current_user['id'])
+        # 配置变更后，若 WebDAV 已启用则异步推送
+        if webdav_sync.is_configured():
+            webdav_sync.push_async()
         return jsonify({'message': '配置已更新'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+# WebDAV 同步
+@main_bp.route('/api/webdav/test', methods=['POST'])
+@login_required
+def webdav_test_route():
+    """测试 WebDAV 连接"""
+    try:
+        ok = webdav_sync.test_connection()
+        if not ok:
+            return jsonify({'ok': False, 'error': '无法连接，请检查地址/账号/密码/目录权限'}), 400
+        return jsonify({'ok': True, 'message': 'WebDAV 连接成功'})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 400
+
+
+@main_bp.route('/api/webdav/sync', methods=['POST'])
+@login_required
+def webdav_sync_route():
+    """手动推送/拉取 WebDAV 同步"""
+    data = request.get_json() or {}
+    action = data.get('action', 'push')
+    try:
+        if action == 'push':
+            r = webdav_sync.push_all()
+        elif action == 'pull':
+            r = webdav_sync.pull_all()
+        else:
+            return jsonify({'ok': False, 'error': '未知操作'}), 400
+        return jsonify({'ok': True, **r})
+    except webdav_sync.WebDAVError as e:
+        return jsonify({'ok': False, 'error': str(e)}), 400
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
 
 
 # 下载历史API

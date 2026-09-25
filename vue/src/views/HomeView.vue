@@ -120,9 +120,10 @@ const startDownload = async () => {
     if (response.ok) {
       if (data.task_id) {
         taskId.value = data.task_id
-        status.value = 'downloading'
-        progressInterval = setInterval(fetchProgress, 1000)
-        timeInterval = setInterval(updateElapsedTime, 1000)
+        status.value = 'queued'
+        // 入队成功即复位按钮，允许继续添加其他用户名/链接；进度可在历史页队列查看
+        isDownloading.value = false
+        if (progressInterval) stopTimers()
       } else if (data.tasks && data.tasks.length > 0) {
         ElMessage.success(data.message)
         isDownloading.value = false

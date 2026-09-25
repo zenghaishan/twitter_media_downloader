@@ -1,5 +1,6 @@
 import os
 import secrets
+import threading
 from flask import Flask
 
 from config import Config
@@ -8,6 +9,7 @@ from routes_auth import auth_bp
 from routes_profile import profile_bp
 from routes_admin import admin_bp
 import database
+import webdav_sync
 
 
 def get_or_create_secret_key() -> str:
@@ -45,6 +47,21 @@ def create_app() -> Flask:
 
 
 app = create_app()
+
+
+def _webdav_startup_pull():
+    """服务启动时若已配置 WebDAV，后台拉取还原（不阻塞启动）"""
+    try:
+        if webdav_sync.is_configured():
+            result = webdav_sync.pull_all()
+            if result.get('restored_config') or result.get('restored_history'):
+                print(f"[webdav] 已从云端还原配置/历史 {result}", flush=True)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+
+
+threading.Thread(target=_webdav_startup_pull, daemon=True).start()
 
 if __name__ == '__main__':
     # use_reloader=False：关闭 debug 热重载，避免重载时丢失下载 worker 线程与内存队列，

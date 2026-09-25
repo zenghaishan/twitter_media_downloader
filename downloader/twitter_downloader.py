@@ -4,7 +4,8 @@ import json
 import os
 import asyncio
 import httpx
-from datetime import datetime
+import email.utils
+from datetime import datetime, timezone
 from typing import Callable, Optional
 
 from logger import DownloadLogger
@@ -162,13 +163,73 @@ class TwitterDownloader:
             size /= 1024
         return f'{size:.1f} TB'
     
+    @staticmethod
+    def _url_name(url: str) -> str:
+        """从 API url 中提取接口操作名，便于日志定位是哪个接口限流/超时"""
+        try:
+            m = re.search(r'/graphql/[A-Za-z0-9_-]+/([A-Za-z0-9_]+)', url)
+            if m:
+                return m.group(1)
+        except Exception:
+            pass
+        return url.split('?')[0].split('/')[-1][:40]
+
+    async def _api_get(self, client, url, timeout: float = 30.0, max_retries: int = 3) -> httpx.Response:
+        """发送 API GET 请求；对限流与网络瞬态异常做退避重试。
+        - HTTP 429：读取 Retry-After（支持“整数秒”/“HTTP-date”），按其等待；
+        - 网络异常（ConnectTimeout/ConnectError/ReadTimeout/RemoteProtocolError/ProxyError）：同款递增退避；
+        - 无 Retry-After 或无法解析时用递增退避（2s/4s/6s...）；
+        - 重试耗尽后：429 返回最后一次 response（交给上层按非 200 处理），网络异常原样抛出。
+        """
+        from email.utils import parsedate_to_datetime
+        attempt = 0
+        last_exc = None
+        while True:
+            response = None
+            try:
+                response = await client.get(url, headers=self.headers, timeout=timeout)
+                self.request_count += 1
+                if response.status_code != 429:
+                    return response
+
+                retry_after = response.headers.get('Retry-After')
+                delay = None
+                if retry_after:
+                    if retry_after.strip().isdigit():
+                        delay = float(retry_after)
+                    else:
+                        try:
+                            dt = parsedate_to_datetime(retry_after)
+                            delay = (dt - datetime.now(timezone.utc)).total_seconds()
+                        except Exception:
+                            delay = None
+                if delay is None or delay < 2:
+                    delay = 2.0 + 2.0 * attempt
+                delay = max(2.0, min(delay, 60.0))
+                reason = f'HTTP 429 限流 (Retry-After={retry_after or "无"})'
+            except (httpx.ConnectError, httpx.ConnectTimeout,
+                    httpx.ReadTimeout, httpx.RemoteProtocolError,
+                    httpx.ProxyError) as exc:
+                last_exc = exc
+                delay = min(2.0 + 2.0 * attempt, 60.0)
+                reason = f'网络异常 {type(exc).__name__}'
+
+            attempt += 1
+            if attempt > max_retries:
+                if response is not None:
+                    return response
+                raise last_exc
+            self._log('warning',
+                      f'{reason}（接口: {self._url_name(url)}），等待 {delay:.0f}s 后重试 ({attempt}/{max_retries})',
+                      'system')
+            await asyncio.sleep(delay)
+
     async def get_other_info(self):
         url = f'https://twitter.com/i/api/graphql/xc8f1g7BYqr6VTzTbvNlGw/UserByScreenName?variables={{"screen_name":"{self.user_info["screen_name"]}","withSafetyModeUserFields":false}}&features={{"hidden_profile_likes_enabled":false,"hidden_profile_subscriptions_enabled":false,"responsive_web_graphql_exclude_directive_enabled":true,"verified_phone_label_enabled":false,"subscriptions_verification_info_verified_since_enabled":true,"highlights_tweets_tab_ui_enabled":true,"creator_subscriptions_tweet_preview_api_enabled":true,"responsive_web_graphql_skip_user_profile_image_extensions_enabled":false,"responsive_web_graphql_timeline_navigation_enabled":true}}&fieldToggles={{"withAuxiliaryUserLabels":false}}'
         
         try:
             async with self._get_client() as client:
-                response = await client.get(self.quote_url(url), headers=self.headers, timeout=30.0)
-                self.request_count += 1
+                response = await self._api_get(client, self.quote_url(url))
                 
                 if response.status_code != 200:
                     error_msg = f'HTTP {response.status_code}'
@@ -190,9 +251,16 @@ class TwitterDownloader:
                 
                 if 'data' not in raw_data:
                     raise Exception('响应中没有data字段')
-                
-                user_result = raw_data['data']['user']['result']
-                
+
+                data_payload = raw_data.get('data') or {}
+                user_node = data_payload.get('user') if isinstance(data_payload, dict) else None
+                if not user_node or not isinstance(user_node, dict) or not user_node.get('result'):
+                    # 用户不可见：不存在 / 被删除 / 被冻结 / 需登录才可见 时 X 返回 data 但 user 为空
+                    screen = self.user_info.get('screen_name', self.user_id)
+                    raise Exception(f'用户不存在或不可访问（@{screen}），可能被删除、冻结或仅登录可见')
+
+                user_result = user_node['result']
+
                 self.user_info['rest_id'] = user_result.get('rest_id') or user_result.get('id')
                 self.user_info['name'] = user_result.get('legacy', {}).get('name')
                 # 将头像URL替换为高清版本 _400x400
@@ -269,7 +337,9 @@ class TwitterDownloader:
         for i in content:
             # 先检查是否有游标
             if 'cursor-bottom' in i.get('entryId', ''):
-                self.user_info['cursor'] = i['content']['value']
+                i_content = i.get('content') if isinstance(i, dict) else None
+                if isinstance(i_content, dict) and 'value' in i_content:
+                    self.user_info['cursor'] = i_content['value']
             
             try:
                 if 'promoted-tweet' in i['entryId']:
@@ -383,8 +453,7 @@ class TwitterDownloader:
         
         try:
             async with self._get_client() as client:
-                response = await client.get(self.quote_url(url), headers=self.headers, timeout=30.0)
-                self.request_count += 1
+                response = await self._api_get(client, self.quote_url(url))
                 
                 try:
                     raw_data = response.json()
@@ -410,15 +479,39 @@ class TwitterDownloader:
                     return False
                 
                 if not self.has_retweet and not self.has_highlights:
-                    for i in raw_data[-1]['entries']:
-                        if 'bottom' in i['entryId']:
-                            self.user_info['cursor'] = i['content']['value']
+                    entries_last = raw_data[-1]['entries'] if (raw_data and isinstance(raw_data[-1], dict) and isinstance(raw_data[-1].get('entries'), list)) else []
+                    for i in entries_last:
+                        i_content = i.get('content') if isinstance(i, dict) else None
+                        if isinstance(i, dict) and 'bottom' in i.get('entryId', '') and isinstance(i_content, dict) and 'value' in i_content:
+                            self.user_info['cursor'] = i_content['value']
                 
                 if self.start_label:
                     if not self.has_retweet and not self.has_highlights:
                         if self.First_Page:
-                            raw_data = raw_data[-1]['entries'][0]['content']['items']
                             self.First_Page = False
+                            # 首页：定位第一个含 items 的模块（首条 entry 可能是 cursor 等，缺 items 时跳过而非崩溃）
+                            entries = raw_data[-1]['entries'] if (raw_data and isinstance(raw_data[-1], dict) and isinstance(raw_data[-1].get('entries'), list)) else None
+                            if not entries:
+                                return None
+                            items = None
+                            for ent in entries:
+                                ent_content = ent.get('content') if isinstance(ent, dict) else None
+                                if isinstance(ent_content, dict) and ent_content.get('items'):
+                                    items = ent_content['items']
+                                    break
+                            if items is None:
+                                # 结构探针：打印首页实际返回的条目形态，用于适配 X 当前时间线结构
+                                def _shape(ent):
+                                    if not isinstance(ent, dict):
+                                        return ('?', None)
+                                    ec = ent.get('content')
+                                    return (ent.get('entryId'), list(ec.keys()) if isinstance(ec, dict) else None)
+                                shapes = [_shape(e) for e in entries[:6]]
+                                print(f"[TimelineShape] entries前6: {shapes}", flush=True)
+                                if self.logger:
+                                    self.logger.error(f'时间线结构未知(未找到items模块)，前6条: {shapes}')
+                                return None
+                            raw_data = items
                         else:
                             if not raw_data or 'moduleItems' not in raw_data[0]:
                                 # 没有更多数据了
@@ -584,6 +677,12 @@ class TwitterDownloader:
             if target_tweet_id is not None:
                 break
     
+    # 整轮结束仍 0 文件：给出可读提示（media_count 只是账号公开统计数，不代表列表接口可取）
+        if self.user_info.get('count', 0) == 0 and (self.downloaded_files + self.skipped_files + self.failed_files) == 0:
+            self._log('warning',
+                      '本次未解析到任何可下载媒体：可能是该用户已设私密/受保护',
+                      'system')
+
     async def preview_media(self, target_tweet_id: str = None):
         """只抓取并返回媒体列表（不下载）。返回值供前端选择后按需下载。"""
         items = []

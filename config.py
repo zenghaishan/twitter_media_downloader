@@ -1,12 +1,20 @@
 import os
+import sys
 
 
 class Config:
     """应用配置"""
-    
-    # 基础路径
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    
+
+    # PyInstaller 打包后：
+    #   BASE_DIR -> exe 所在目录，作为可写数据区（data.db / downloads / avatars / thumbnails）
+    #   RESOURCE_DIR -> 解压出的只读资源目录（含前端 vue/dist）
+    if getattr(sys, 'frozen', False):
+        BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
+        RESOURCE_DIR = getattr(sys, '_MEIPASS', BASE_DIR)
+    else:
+        BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+        RESOURCE_DIR = BASE_DIR
+
     # 下载目录
     DOWNLOAD_FOLDER = os.path.join(BASE_DIR, 'downloads')
     
